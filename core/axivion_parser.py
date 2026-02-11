@@ -182,31 +182,47 @@ class AxivionParser:
         Normalise violation file paths to be relative to workspace_root.
 
         Axivion reports may contain absolute paths from the analysis server
-        (e.g. /opt/axivion/checkout/src/main.c) that don't match the user's
-        workspace.  This method strips any prefix so that paths become
-        workspace-relative (e.g. src/main.c).
+        (e.g. /opt/axivion/checkout/src/main.c or C:\\build\\src\\main.c) that
+        don't match the user's workspace.  This method strips any prefix so
+        that paths become workspace-relative with forward slashes
+        (e.g. src/main.c).
+
+        On Windows, comparisons are case-insensitive.
         """
         ws = os.path.abspath(workspace_root)
+        ws_nc = os.path.normcase(ws)   # lowercase on Windows, unchanged on POSIX
+
         for v in self.violations:
             fp = v.file_path
-            # Already relative and exists in workspace — leave it
+
+            # Normalise separators for consistent matching
+            fp_norm = fp.replace("\\", "/")
+
+            # Already relative and exists in workspace — normalise and keep
             if not os.path.isabs(fp):
-                if os.path.isfile(os.path.join(ws, fp)):
+                native = fp.replace("/", os.sep).replace("\\", os.sep)
+                if os.path.isfile(os.path.join(ws, native)):
+                    v.file_path = fp_norm
                     continue
 
-            # Absolute path that starts with workspace root
+            # Absolute path that starts with workspace root (case-insensitive on Win)
             abs_fp = os.path.abspath(fp) if os.path.isabs(fp) else fp
-            if abs_fp.startswith(ws + os.sep):
-                v.file_path = os.path.relpath(abs_fp, ws)
+            abs_nc = os.path.normcase(abs_fp)
+            if abs_nc.startswith(ws_nc + os.sep) or abs_nc.startswith(ws_nc + "/"):
+                v.file_path = os.path.relpath(abs_fp, ws).replace("\\", "/")
                 continue
 
             # Try to match by finding the longest suffix that exists in workspace
-            parts = fp.replace("\\", "/").split("/")
+            parts = fp_norm.split("/")
             for i in range(len(parts)):
-                candidate = os.path.join(*parts[i:])
-                if os.path.isfile(os.path.join(ws, candidate)):
-                    v.file_path = candidate
+                candidate_posix = "/".join(parts[i:])
+                candidate_native = candidate_posix.replace("/", os.sep)
+                if os.path.isfile(os.path.join(ws, candidate_native)):
+                    v.file_path = candidate_posix
                     break
+            else:
+                # No match found — at least normalise separators
+                v.file_path = fp_norm
 
         logger.info(
             "Normalised %d violation paths against workspace %s",

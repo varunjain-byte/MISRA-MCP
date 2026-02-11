@@ -96,9 +96,12 @@ class CAnalyzer:
         self._cache: Dict[str, Tuple[bytes, object]] = {}  # path -> (source, tree)
 
     def _resolve(self, file_path: str) -> str:
-        if os.path.isabs(file_path):
-            return file_path
-        return os.path.join(self.workspace_root, file_path)
+        """Resolve a (possibly POSIX-style) relative path to an absolute path."""
+        # Normalise separators so 'src/main.c' works on Windows too
+        native = file_path.replace("/", os.sep).replace("\\", os.sep)
+        if os.path.isabs(native):
+            return native
+        return os.path.join(self.workspace_root, native)
 
     def _get_tree(self, file_path: str) -> Tuple[Optional[bytes], Optional[object]]:
         """Parse file and cache the result."""

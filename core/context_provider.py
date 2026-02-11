@@ -29,7 +29,9 @@ class ContextProvider:
     # ────────────────────────────────────────────────────────────────
 
     def _resolve(self, file_path: str) -> str:
-        return os.path.join(self.workspace_root, file_path)
+        # Normalise separators so 'src/main.c' works on Windows too
+        native = file_path.replace("/", os.sep).replace("\\", os.sep)
+        return os.path.join(self.workspace_root, native)
 
     @staticmethod
     def _read_lines(full_path: str) -> Optional[List[str]]:

@@ -30,6 +30,17 @@ _parser = Parser(C_LANGUAGE)
 _C_EXTENSIONS = {".c", ".h", ".cc", ".cpp", ".hh", ".hpp"}
 
 
+def _norm_path(p: str) -> str:
+    """Normalise a path to forward slashes for cross-platform consistency.
+
+    On Windows, os.path.relpath returns backslash-separated paths
+    (e.g. 'src\\main.c').  We normalise everything to POSIX forward
+    slashes so that stored paths and query paths can be compared
+    without platform-specific workarounds.
+    """
+    return p.replace("\\", "/")
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  Data types
 # ═══════════════════════════════════════════════════════════════════════
@@ -169,7 +180,7 @@ class IncludeGraph:
         current_dir = os.path.dirname(os.path.join(self.workspace_root, current_file))
         candidate = os.path.join(current_dir, include_name)
         if os.path.isfile(candidate):
-            return os.path.relpath(candidate, self.workspace_root)
+            return _norm_path(os.path.relpath(candidate, self.workspace_root))
 
         # Search include directories
         for inc_dir in self.include_dirs:
@@ -178,12 +189,12 @@ class IncludeGraph:
             )
             candidate = os.path.join(full_dir, include_name)
             if os.path.isfile(candidate):
-                return os.path.relpath(candidate, self.workspace_root)
+                return _norm_path(os.path.relpath(candidate, self.workspace_root))
 
         # Search workspace root
         candidate = os.path.join(self.workspace_root, include_name)
         if os.path.isfile(candidate):
-            return os.path.relpath(candidate, self.workspace_root)
+            return _norm_path(os.path.relpath(candidate, self.workspace_root))
 
         return None
 
@@ -233,7 +244,8 @@ class SymbolTable:
 
     def find_in_file(self, name: str, file_path: str) -> List[SymbolEntry]:
         """Entries for a symbol in a specific file."""
-        return [e for e in self.find(name) if e.file == file_path]
+        nfp = _norm_path(file_path)
+        return [e for e in self.find(name) if e.file == nfp]
 
     def find_header_declaration(self, name: str) -> Optional[SymbolEntry]:
         """Find a declaration in a .h file (for 8.3, 8.4)."""
@@ -263,8 +275,9 @@ class SymbolTable:
 
     def is_used_outside_file(self, name: str, source_file: str) -> bool:
         """Check if symbol appears in any file other than source_file (Rule 8.8, 8.9)."""
+        nsf = _norm_path(source_file)
         for e in self.find(name):
-            if e.file != source_file:
+            if e.file != nsf:
                 return True
         return False
 
@@ -637,7 +650,7 @@ class WorkspaceIndex:
             for fname in filenames:
                 ext = os.path.splitext(fname)[1].lower()
                 if ext in _C_EXTENSIONS:
-                    rel = os.path.relpath(os.path.join(root, fname), self.workspace_root)
+                    rel = _norm_path(os.path.relpath(os.path.join(root, fname), self.workspace_root))
                     files.append(rel)
         return sorted(files)
 
