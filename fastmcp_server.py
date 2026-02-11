@@ -5,9 +5,9 @@ Exposes five tools to GitHub Copilot via the Model Context Protocol:
 
   1. load_report       — load an Axivion JSON report + workspace root
   2. list_violations   — list all violations for a file
-  3. analyze_violation — deep analysis: code context + rule explanation + fix
+  3. analyze_violation — deep analysis: code context + AST analysis + rule explanation
   4. explain_rule      — full MISRA rule explanation with examples
-  5. propose_fix       — concrete, confidence-scored fix suggestion
+  5. propose_fix       — AST-informed fix analysis with structural evidence
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -19,6 +19,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from core.axivion_parser import AxivionParser
 from core.context_provider import ContextProvider
+from core.c_analyzer import CAnalyzer
 from core.misra_knowledge_base import format_rule_explanation, get_rule
 from core.fix_engine import FixEngine
 
@@ -30,7 +31,8 @@ mcp = FastMCP("Axivion MISRA Agent")
 
 parser = None
 context_provider = None
-fix_engine = FixEngine()
+analyzer = None
+fix_engine = None
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Tool 1 — Load Report
@@ -45,7 +47,7 @@ def load_report(report_path: str, workspace_root: str) -> str:
         report_path:    Absolute path to the Axivion JSON report.
         workspace_root: Root directory of the workspace containing source code.
     """
-    global parser, context_provider
+    global parser, context_provider, analyzer, fix_engine
 
     if not os.path.exists(report_path):
         return f"Error: Report file not found at {report_path}"
@@ -55,6 +57,8 @@ def load_report(report_path: str, workspace_root: str) -> str:
     try:
         parser = AxivionParser(report_path)
         context_provider = ContextProvider(workspace_root)
+        analyzer = CAnalyzer(workspace_root)
+        fix_engine = FixEngine(analyzer)
         count = len(parser.get_all_violations())
         return f"Successfully loaded report. Found {count} violations."
     except Exception as e:
@@ -93,14 +97,14 @@ def list_violations(file_path: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Tool 3 — Analyse Violation (enhanced)
+#  Tool 3 — Analyse Violation (enhanced with AST)
 # ═══════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
 def analyze_violation(rule_id: str, file_path: str) -> str:
     """
     Returns detailed analysis of a specific violation:
-    code context, rule explanation, and a concrete fix suggestion.
+    code context, AST analysis, rule explanation, and fix guidance.
 
     Args:
         rule_id:   The MISRA rule ID (e.g. 'MisraC2012-8.3').
@@ -125,8 +129,8 @@ def analyze_violation(rule_id: str, file_path: str) -> str:
     # Rule explanation
     rule_info = format_rule_explanation(rule_id)
 
-    # Fix suggestion
-    suggestion = fix_engine.propose_fix(target, context, viol_line, deps)
+    # AST-informed fix analysis
+    fix_analysis = fix_engine.propose_fix(target, context, viol_line, deps)
 
     analysis = f"""## Violation Analysis
 
@@ -152,7 +156,7 @@ def analyze_violation(rule_id: str, file_path: str) -> str:
 
 ---
 
-{suggestion.to_markdown()}
+{fix_analysis.to_markdown()}
 """
     return analysis
 
@@ -174,17 +178,17 @@ def explain_rule(rule_id: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Tool 5 — Propose Fix
+#  Tool 5 — Propose Fix (AST-informed)
 # ═══════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
 def propose_fix(rule_id: str, file_path: str, line_number: int) -> str:
     """
-    Returns a concrete, confidence-scored fix suggestion for a specific
-    violation at a given line.
+    Returns an AST-informed fix analysis for a specific violation.
 
-    Includes: the violating line, the suggested replacement, an explanation
-    of the change, the broader fix strategy, and any side-effect warnings.
+    Uses tree-sitter to parse the C source file and provide structural
+    evidence (parameter usage, pointer write analysis, scope, reachability)
+    that enables the LLM to generate the correct fix.
 
     Args:
         rule_id:     The MISRA rule ID (e.g. 'MisraC2012-8.10').
@@ -211,8 +215,8 @@ def propose_fix(rule_id: str, file_path: str, line_number: int) -> str:
     viol_line = context_provider.get_line(file_path, line_number)
     deps = context_provider.analyze_dependencies(file_path)
 
-    suggestion = fix_engine.propose_fix(target, context, viol_line, deps)
-    return suggestion.to_markdown()
+    analysis = fix_engine.propose_fix(target, context, viol_line, deps)
+    return analysis.to_markdown()
 
 
 # ═══════════════════════════════════════════════════════════════════════

@@ -3,21 +3,14 @@ MISRA C:2012 Rule Knowledge Base
 
 Structured data for rules 2.x (Unused Code), 8.x (Declarations & Definitions),
 and 10.x (Essential Type Model).  Each entry provides the official title, category,
-rationale, compliant / non-compliant examples, human-readable fix strategy, and a
-machine-readable regex fix pattern (where a mechanical transformation exists).
+rationale, compliant / non-compliant examples, and human-readable fix strategy.
+
+Fix generation is handled by the AST-aware fix engine (fix_engine.py + c_analyzer.py).
 """
 
 from typing import Dict, Optional, List
 from dataclasses import dataclass, field
-import re
 
-
-@dataclass
-class FixPattern:
-    """A regex-based pattern that can mechanically fix a violation."""
-    search: str           # regex to match on the violating line(s)
-    replace: str          # replacement template (may use \\1, \\2, …)
-    description: str      # what the transform does
 
 @dataclass
 class MisraRule:
@@ -28,7 +21,6 @@ class MisraRule:
     non_compliant: str                     # code example
     compliant: str                         # fixed code example
     fix_strategy: str                      # human-readable guidance
-    fix_patterns: List[FixPattern] = field(default_factory=list)
     cross_references: List[str] = field(default_factory=list)
 
 
@@ -196,13 +188,6 @@ void f(int x) {
         "verify that the cleanup logic is still reachable via structured "
         "control flow."
     ),
-    fix_patterns=[
-        FixPattern(
-            search=r'^(\s*)\w+:\s*(/\*.*\*/)?\s*$',
-            replace='',
-            description="Remove the unused label line",
-        )
-    ],
     cross_references=[],
 ))
 
@@ -232,13 +217,6 @@ int callback(int used, int unused_a, int unused_b) {
         "changing the API (but beware breaking callers / function-pointer "
         "compatibility)."
     ),
-    fix_patterns=[
-        FixPattern(
-            search=r'(\w+)',
-            replace='(void)\\1;',
-            description="Cast the unused parameter to (void)",
-        )
-    ],
     cross_references=[],
 ))
 
@@ -266,13 +244,6 @@ void bar(int x) { (void)x; }""",
         "'int' (or the correct return type).  For K&R-style parameters, "
         "convert to prototype form with explicit types."
     ),
-    fix_patterns=[
-        FixPattern(
-            search=r'^(\s*)(\w+)\s*\(',
-            replace=r'\1int \2(',
-            description="Add 'int' return type to implicit-int function",
-        )
-    ],
     cross_references=["MisraC2012-8.2"],
 ))
 
@@ -295,13 +266,6 @@ int noparam(void);""",
         "For unnamed parameters, add descriptive names.  "
         "For empty parentheses, replace () with (void)."
     ),
-    fix_patterns=[
-        FixPattern(
-            search=r'\(\s*\)',
-            replace='(void)',
-            description="Replace empty () with (void)",
-        )
-    ],
     cross_references=["MisraC2012-8.1"],
 ))
 
@@ -442,13 +406,6 @@ static void helper(void) {
         "Verify that the function/object is not referenced in any other "
         "translation unit before making this change."
     ),
-    fix_patterns=[
-        FixPattern(
-            search=r'^(\s*)((?:void|int|char|float|double|unsigned|signed|long|short)\s)',
-            replace=r'\1static \2',
-            description="Add 'static' keyword before the type",
-        )
-    ],
     cross_references=["MisraC2012-8.4"],
 ))
 
@@ -491,13 +448,6 @@ inline int square(int x) { return x * x; }""",
     compliant="""\
 static inline int square(int x) { return x * x; }""",
     fix_strategy="Add 'static' before 'inline'.",
-    fix_patterns=[
-        FixPattern(
-            search=r'^(\s*)inline\b',
-            replace=r'\1static inline',
-            description="Add 'static' before 'inline'",
-        )
-    ],
     cross_references=["MisraC2012-8.8"],
 ))
 
@@ -576,13 +526,6 @@ int sum(const int *data, int len) {
         "function never modifies data through the pointer.  Update "
         "the corresponding prototype in the header file."
     ),
-    fix_patterns=[
-        FixPattern(
-            search=r'(\w+)\s*\*(\s*\w+)',
-            replace=r'const \1 *\2',
-            description="Add 'const' qualifier to pointer parameter",
-        )
-    ],
     cross_references=[],
 ))
 
@@ -604,13 +547,6 @@ void copy(int *dst, const int *src, int n) {
     for (int i = 0; i < n; i++) dst[i] = src[i];
 }""",
     fix_strategy="Remove the 'restrict' qualifier from all pointer parameters.",
-    fix_patterns=[
-        FixPattern(
-            search=r'\brestrict\s*',
-            replace='',
-            description="Remove 'restrict' qualifier",
-        )
-    ],
     cross_references=[],
 ))
 

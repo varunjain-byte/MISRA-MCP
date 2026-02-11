@@ -5,6 +5,7 @@ Additional hardening tests:
   3. Parser handles non-existent and binary files
   4. Context provider handles binary files and missing files
   5. MCP server module imports successfully and registers all 5 tools
+  6. C Analyzer handles edge cases (binary files, missing files)
 """
 import sys
 import os
@@ -171,7 +172,8 @@ def run_tests():
         from core.axivion_parser import AxivionParser as AP
         from core.context_provider import ContextProvider as CP
         from core.misra_knowledge_base import get_rule, get_all_rules, format_rule_explanation
-        from core.fix_engine import FixEngine, FixSuggestion
+        from core.fix_engine import FixEngine, FixAnalysis
+        from core.c_analyzer import CAnalyzer as CA
         print("  All core modules import successfully ✓")
     except ImportError as e:
         print(f"  ✗ Import failed: {e}")
