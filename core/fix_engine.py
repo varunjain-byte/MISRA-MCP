@@ -150,6 +150,66 @@ class FixAnalysis:
                 kind = "definition" if d.get("is_definition") else "declaration"
                 lines.append(f"  - Line {d['line']} ({kind}): `{d.get('context', '').strip()}`")
 
+        # ── Cross-file evidence ──
+        cross = self.ast_findings.get("cross_file", {})
+        if cross:
+            lines.append("- **Cross-file analysis**:")
+
+            # 8.3: declaration vs definition diff
+            if cross.get("mismatches"):
+                lines.append("  - **Signature mismatches:**")
+                for m in cross["mismatches"]:
+                    lines.append(f"    - {m}")
+                if cross.get("declaration"):
+                    d = cross["declaration"]
+                    lines.append(f"  - Declaration: `{d['file']}:{d['line']}` → `{d['signature']}`")
+                if cross.get("definition"):
+                    d = cross["definition"]
+                    lines.append(f"  - Definition:  `{d['file']}:{d['line']}` → `{d['signature']}`")
+
+            # 8.4: prior declaration search
+            if "has_prior_declaration" in cross:
+                if cross["has_prior_declaration"]:
+                    for d in cross.get("declarations", []):
+                        lines.append(f"  - Prototype in `{d['file']}:{d['line']}`")
+                else:
+                    lines.append("  - ⚠ No prototype found in any included header")
+
+            # 8.5: duplicate extern
+            if cross.get("has_duplicates"):
+                lines.append("  - ⚠ Duplicate extern declarations:")
+                for loc in cross.get("extern_locations", []):
+                    lines.append(f"    - `{loc['file']}:{loc['line']}`")
+
+            # 8.6: multiple definitions
+            if cross.get("has_multiple_definitions"):
+                lines.append("  - ⚠ Multiple definitions:")
+                for loc in cross.get("definitions", []):
+                    lines.append(f"    - `{loc['file']}:{loc['line']}`")
+
+            # 8.8: external callers
+            if "safe_to_add_static" in cross:
+                if cross["safe_to_add_static"]:
+                    lines.append("  - ✅ No external callers — safe to add `static`")
+                else:
+                    lines.append("  - ❌ Cannot add `static` — external callers exist:")
+                    for c in cross.get("external_callers", [])[:5]:
+                        lines.append(f"    - `{c['file']}:{c['line']}` in `{c['calling_function']}`")
+                    if cross.get("declared_in_header"):
+                        lines.append(f"  - Declared in header: `{cross['declared_in_header']}`")
+
+            # 8.13: caller impact
+            if cross.get("total_callers") is not None:
+                total = cross["total_callers"]
+                lines.append(f"  - **Callers to update**: {total}")
+                for c in cross.get("callers", [])[:5]:
+                    lines.append(f"    - `{c['file']}:{c['line']}` in `{c['calling_function']}`")
+                if cross.get("header_to_update"):
+                    lines.append(f"  - Header to update: `{cross['header_to_update']}`")
+                affected = cross.get("files_affected", [])
+                if affected:
+                    lines.append(f"  - Files affected: {', '.join(f'`{f}`' for f in affected)}")
+
         if not lines:
             lines.append("- No additional AST analysis available for this rule.")
 
@@ -159,7 +219,8 @@ class FixAnalysis:
 # Rules where the fix may affect other files / callers
 _CROSS_FILE_RULES = {
     "MisraC2012-8.3", "MisraC2012-8.4", "MisraC2012-8.5",
-    "MisraC2012-8.6", "MisraC2012-8.8", "MisraC2012-8.13",
+    "MisraC2012-8.6", "MisraC2012-8.8", "MisraC2012-8.9",
+    "MisraC2012-8.11", "MisraC2012-8.13", "MisraC2012-8.14",
 }
 
 
@@ -326,6 +387,25 @@ class FixEngine:
 
         # ── Rule 8.3: Declaration mismatch ──
         if rid == "MisraC2012-8.3":
+            cross = findings.get("cross_file", {})
+            if cross and cross.get("mismatches"):
+                parts = [f"- {m}" for m in cross["mismatches"]]
+                decl_info = ""
+                if cross.get("declaration"):
+                    d = cross["declaration"]
+                    decl_info += f"\n- Declaration in `{d['file']}:{d['line']}`"
+                    decl_info += f"\n  `{d['signature']}`"
+                if cross.get("definition"):
+                    d = cross["definition"]
+                    decl_info += f"\n- Definition in `{d['file']}:{d['line']}`"
+                    decl_info += f"\n  `{d['signature']}`"
+                return (
+                    f"**Cross-file signature mismatches:**\n"
+                    + "\n".join(parts)
+                    + decl_info + "\n\n"
+                    f"Ensure the declaration in the header matches the definition exactly."
+                )
+            # Fallback to same-file check
             decls = findings.get("declarations", [])
             if len(decls) >= 2:
                 parts = [
@@ -335,18 +415,29 @@ class FixEngine:
                 return (
                     f"**Mismatched declarations found:**\n" + "\n".join(parts) + "\n\n"
                     f"Ensure all declarations use identical parameter names and type "
-                    f"qualifiers. Update the definition to match the declaration, or "
-                    f"vice versa."
+                    f"qualifiers."
                 )
             return rule.fix_strategy
 
         # ── Rule 8.4: No prior declaration ──
         if rid == "MisraC2012-8.4":
             fn_info = findings.get("function", {})
+            cross = findings.get("cross_file", {})
+            if cross and cross.get("has_prior_declaration"):
+                decls = cross.get("declarations", [])
+                files_str = ", ".join(f"`{d['file']}`" for d in decls)
+                return (
+                    f"Prototype found in: {files_str}\n\n"
+                    f"Verify the declaration is compatible with the definition."
+                )
             if fn_info:
+                searched = ""
+                if cross and cross.get("included_headers"):
+                    searched = (f"\n\nSearched {len(cross['included_headers'])} "
+                                f"included headers — none contain a prototype.")
                 return (
                     f"Function `{fn_info.get('name', '?')}` has external linkage but "
-                    f"no prior compatible declaration is visible.\n\n"
+                    f"no prior compatible declaration is visible.{searched}\n\n"
                     f"**Fix**: Add a prototype in the appropriate header file:\n"
                     f"```c\n{fn_info.get('signature', '?')};\n```"
                 )
@@ -355,7 +446,32 @@ class FixEngine:
         # ── Rule 8.8: Missing static ──
         if rid == "MisraC2012-8.8":
             fn_info = findings.get("function", {})
-            scope = findings.get("symbol_scope", "")
+            cross = findings.get("cross_file", {})
+            if cross:
+                if cross.get("safe_to_add_static"):
+                    return (
+                        f"**Cross-file analysis confirms**: `{fn_info.get('name', '?')}` "
+                        f"has no external callers and no header declaration.\n\n"
+                        f"**Fix**: Add `static` storage class specifier — safe to do."
+                    )
+                else:
+                    callers = cross.get("external_callers", [])
+                    caller_strs = [f"- `{c['file']}:{c['line']}` ({c['calling_function']})"
+                                   for c in callers[:5]]
+                    header = cross.get("declared_in_header")
+                    warnings = []
+                    if caller_strs:
+                        warnings.append(
+                            f"**External callers ({len(callers)}):**\n" +
+                            "\n".join(caller_strs)
+                        )
+                    if header:
+                        warnings.append(f"Declared in header: `{header}`")
+                    return (
+                        f"Function `{fn_info.get('name', '?')}` should use `static` "
+                        f"but **cannot be safely changed** without updating:\n\n"
+                        + "\n\n".join(warnings)
+                    )
             if fn_info and not fn_info.get("is_static"):
                 return (
                     f"Function `{fn_info.get('name', '?')}` has internal linkage "
@@ -435,27 +551,64 @@ class FixEngine:
     def _assess_side_effects(rule: MisraRule, findings: Dict,
                              dependencies: Optional[List[str]]) -> List[str]:
         effects = []
+        cross = findings.get("cross_file", {})
 
         if rule.rule_id in _CROSS_FILE_RULES:
-            effects.append(
-                "This fix may require corresponding changes in other files "
-                "(headers, callers, or other translation units)."
-            )
+            if cross:
+                # Use specific cross-file evidence
+                affected = cross.get("files_affected", [])
+                if affected:
+                    effects.append(
+                        f"Files that need updating: {', '.join(f'`{f}`' for f in affected)}"
+                    )
+
+                ext_callers = cross.get("external_callers", [])
+                if ext_callers:
+                    effects.append(
+                        f"{len(ext_callers)} external caller(s) must be reviewed."
+                    )
+
+                header = cross.get("declared_in_header") or cross.get("header_to_update")
+                if header:
+                    effects.append(f"Header `{header}` must be updated to match.")
+            else:
+                effects.append(
+                    "This fix may require corresponding changes in other files "
+                    "(headers, callers, or other translation units)."
+                )
 
         # Rule 8.13: const addition affects API
         if rule.rule_id == "MisraC2012-8.13":
-            effects.append(
-                "Adding `const` to a function parameter changes its signature — "
-                "update the declaration in the header file and all callers."
-            )
+            total_callers = cross.get("total_callers", 0) if cross else 0
+            if total_callers > 0:
+                effects.append(
+                    f"Adding `const` changes the API — {total_callers} caller(s) and "
+                    f"the header declaration must be updated."
+                )
+            else:
+                effects.append(
+                    "Adding `const` to a function parameter changes its signature — "
+                    "update the declaration in the header file and all callers."
+                )
 
         # Scope changes
         fn_info = findings.get("function", {})
         if fn_info and rule.rule_id in ("MisraC2012-8.8", "MisraC2012-8.10"):
-            effects.append(
-                f"Adding `static` to `{fn_info.get('name', '?')}` removes external "
-                f"linkage — ensure no other TU calls this function."
-            )
+            if cross and cross.get("safe_to_add_static"):
+                effects.append(
+                    f"Cross-file analysis confirms `{fn_info.get('name', '?')}` is "
+                    f"not used externally — `static` is safe."
+                )
+            elif cross and cross.get("has_external_callers"):
+                effects.append(
+                    f"Adding `static` to `{fn_info.get('name', '?')}` will break "
+                    f"external callers — fix those first or keep external linkage."
+                )
+            else:
+                effects.append(
+                    f"Adding `static` to `{fn_info.get('name', '?')}` removes external "
+                    f"linkage — ensure no other TU calls this function."
+                )
 
         return effects
 

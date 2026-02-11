@@ -9,6 +9,7 @@ Provides deep structural understanding of C source files:
   • Reachability analysis (code after return/break/continue)
   • Declaration and reference finding
   • Enum constant value computation
+  • Cross-file analysis via WorkspaceIndex (optional)
 """
 
 import os
@@ -87,10 +88,11 @@ class EnumConstant:
 # ═══════════════════════════════════════════════════════════════════════
 
 class CAnalyzer:
-    """AST-based C source file analyzer."""
+    """AST-based C source file analyzer with optional cross-file support."""
 
-    def __init__(self, workspace_root: str):
+    def __init__(self, workspace_root: str, workspace_index=None):
         self.workspace_root = workspace_root
+        self.index = workspace_index  # Optional WorkspaceIndex for cross-file queries
         self._cache: Dict[str, Tuple[bytes, object]] = {}  # path -> (source, tree)
 
     def _resolve(self, file_path: str) -> str:
@@ -556,8 +558,12 @@ class CAnalyzer:
         """
         Run rule-specific AST analysis and return structured findings.
         This is the main entry point used by the FixEngine.
+
+        When a WorkspaceIndex is available (self.index), cross-file evidence
+        is added for rules 8.3, 8.4, 8.5, 8.6, 8.8, and 8.13.
         """
         analysis = {"rule_id": rule_id, "line": line}
+        analysis["has_cross_file"] = self.index is not None and self.index.is_built
 
         fn = self.get_function_at_line(file_path, line)
         if fn:
@@ -588,23 +594,67 @@ class CAnalyzer:
             analysis["function"] = None
             analysis["params"] = []
 
-        # Rule-specific enrichments
+        # ── Rule-specific enrichments ──
+
         if rule_id == "MisraC2012-2.1":
             reason = self.is_unreachable(file_path, line)
             analysis["unreachable_reason"] = reason
 
         elif rule_id == "MisraC2012-2.7" and fn:
-            # Highlight which params are unused
             analysis["unused_params"] = [
                 p.name for p in fn.params
                 if p.read_count == 0 and p.write_count == 0
             ]
 
+        elif rule_id == "MisraC2012-8.3" and fn:
+            # ── Cross-file: compare header declaration with definition ──
+            if self.index and self.index.is_built:
+                analysis["cross_file"] = self.index.check_rule_8_3(fn.name)
+
+        elif rule_id == "MisraC2012-8.4" and fn:
+            # ── Cross-file: check for prior declaration in headers ──
+            if self.index and self.index.is_built:
+                analysis["cross_file"] = self.index.check_rule_8_4(
+                    fn.name, file_path
+                )
+
+        elif rule_id == "MisraC2012-8.5":
+            sym = self._extract_symbol_name(file_path, line)
+            if sym:
+                analysis["symbol_scope"] = self.get_symbol_scope(file_path, sym)
+                if self.index and self.index.is_built:
+                    analysis["cross_file"] = self.index.check_rule_8_5(sym)
+
+        elif rule_id == "MisraC2012-8.6":
+            sym = self._extract_symbol_name(file_path, line)
+            if sym:
+                if self.index and self.index.is_built:
+                    analysis["cross_file"] = self.index.check_rule_8_6(sym)
+
+        elif rule_id == "MisraC2012-8.8" and fn:
+            analysis["needs_static"] = not fn.is_static
+            if self.index and self.index.is_built:
+                analysis["cross_file"] = self.index.check_rule_8_8(
+                    fn.name, file_path
+                )
+                # Override simple heuristic with cross-file evidence
+                cf = analysis["cross_file"]
+                analysis["safe_to_add_static"] = cf.get("safe_to_add_static", False)
+
         elif rule_id == "MisraC2012-8.10" and fn:
             analysis["needs_static"] = fn.is_inline and not fn.is_static
 
+        elif rule_id == "MisraC2012-8.12":
+            enums = self.get_enum_values(file_path)
+            val_map: Dict[int, List[str]] = {}
+            for ec in enums:
+                val_map.setdefault(ec.value, []).append(ec.name)
+            analysis["enum_collisions"] = {
+                v: names for v, names in val_map.items() if len(names) > 1
+            }
+
         elif rule_id == "MisraC2012-8.13" and fn:
-            # Which pointer params are never written through?
+            # Single-file: which pointer params are never written through?
             analysis["const_candidates"] = [
                 {
                     "name": p.name,
@@ -616,34 +666,31 @@ class CAnalyzer:
                 for p in fn.params
                 if p.is_pointer
             ]
-
-        elif rule_id == "MisraC2012-8.12":
-            enums = self.get_enum_values(file_path)
-            # Find value collisions
-            val_map: Dict[int, List[str]] = {}
-            for ec in enums:
-                val_map.setdefault(ec.value, []).append(ec.name)
-            analysis["enum_collisions"] = {
-                v: names for v, names in val_map.items() if len(names) > 1
-            }
+            # ── Cross-file: caller impact analysis ──
+            if self.index and self.index.is_built:
+                analysis["cross_file"] = self.index.check_rule_8_13(fn.name)
 
         elif rule_id.startswith("MisraC2012-8."):
-            # Find symbol declarations for linkage rules
-            lines = self._source_lines(file_path)
-            if line <= len(lines):
-                line_text = lines[line - 1]
-                # Extract identifier from the line
-                m = re.search(r'\b(\w+)\s*[(\[;]', line_text)
-                if m:
-                    sym = m.group(1)
-                    analysis["symbol_scope"] = self.get_symbol_scope(file_path, sym)
-                    analysis["declarations"] = [
-                        {"line": r.line, "context": r.context,
-                         "is_definition": r.is_definition}
-                        for r in self.find_declarations(file_path, sym)
-                    ]
+            # Generic linkage analysis for remaining 8.x rules
+            sym = self._extract_symbol_name(file_path, line)
+            if sym:
+                analysis["symbol_scope"] = self.get_symbol_scope(file_path, sym)
+                analysis["declarations"] = [
+                    {"line": r.line, "context": r.context,
+                     "is_definition": r.is_definition}
+                    for r in self.find_declarations(file_path, sym)
+                ]
 
         return analysis
+
+    def _extract_symbol_name(self, file_path: str, line: int) -> Optional[str]:
+        """Extract the primary identifier from a line of code."""
+        lines = self._source_lines(file_path)
+        if line > len(lines):
+            return None
+        line_text = lines[line - 1]
+        m = re.search(r'\b(\w+)\s*[(\[;]', line_text)
+        return m.group(1) if m else None
 
     # ────────────────────────────────────────────────────────────────
     #  Tree traversal helpers

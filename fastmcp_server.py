@@ -1,13 +1,14 @@
 """
 Axivion MISRA Agent — MCP Server
 
-Exposes five tools to GitHub Copilot via the Model Context Protocol:
+Exposes six tools to GitHub Copilot via the Model Context Protocol:
 
   1. load_report       — load an Axivion JSON report + workspace root
   2. list_violations   — list all violations for a file
-  3. analyze_violation — deep analysis: code context + AST analysis + rule explanation
+  3. analyze_violation — deep analysis: code context + AST + cross-file + rule
   4. explain_rule      — full MISRA rule explanation with examples
   5. propose_fix       — AST-informed fix analysis with structural evidence
+  6. cross_file_impact — show which files are affected by fixing a symbol
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -20,6 +21,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from core.axivion_parser import AxivionParser
 from core.context_provider import ContextProvider
 from core.c_analyzer import CAnalyzer
+from core.workspace_index import WorkspaceIndex
 from core.misra_knowledge_base import format_rule_explanation, get_rule
 from core.fix_engine import FixEngine
 
@@ -33,6 +35,7 @@ parser = None
 context_provider = None
 analyzer = None
 fix_engine = None
+workspace_index = None
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Tool 1 — Load Report
@@ -43,11 +46,15 @@ def load_report(report_path: str, workspace_root: str) -> str:
     """
     Loads the Axivion analysis report and initialises the context provider.
 
+    Also builds a cross-file WorkspaceIndex that scans all .c/.h files
+    to enable cross-translation-unit analysis (include graph, symbol table,
+    call graph).
+
     Args:
         report_path:    Absolute path to the Axivion JSON report.
         workspace_root: Root directory of the workspace containing source code.
     """
-    global parser, context_provider, analyzer, fix_engine
+    global parser, context_provider, analyzer, fix_engine, workspace_index
 
     if not os.path.exists(report_path):
         return f"Error: Report file not found at {report_path}"
@@ -57,10 +64,22 @@ def load_report(report_path: str, workspace_root: str) -> str:
     try:
         parser = AxivionParser(report_path)
         context_provider = ContextProvider(workspace_root)
-        analyzer = CAnalyzer(workspace_root)
+
+        # Build cross-file index
+        workspace_index = WorkspaceIndex(workspace_root)
+        workspace_index.build()
+
+        # Create analyzer with cross-file support
+        analyzer = CAnalyzer(workspace_root, workspace_index=workspace_index)
         fix_engine = FixEngine(analyzer)
+
         count = len(parser.get_all_violations())
-        return f"Successfully loaded report. Found {count} violations."
+        idx = workspace_index.get_summary()
+        return (
+            f"Successfully loaded report. Found {count} violations.\n"
+            f"Workspace indexed: {idx['c_files']} .c files, {idx['h_files']} .h files, "
+            f"{idx['symbols']} symbols, {idx['call_sites']} call sites."
+        )
     except Exception as e:
         return f"Error loading report: {e}"
 
@@ -217,6 +236,71 @@ def propose_fix(rule_id: str, file_path: str, line_number: int) -> str:
 
     analysis = fix_engine.propose_fix(target, context, viol_line, deps)
     return analysis.to_markdown()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Tool 6 — Cross-File Impact
+# ═══════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def cross_file_impact(symbol_name: str) -> str:
+    """
+    Shows which files are affected by changing a symbol (function, variable,
+    type, or macro). Uses the workspace index to find all declarations,
+    definitions, and callers across the project.
+
+    Args:
+        symbol_name: Name of the function, variable, or type to check.
+    """
+    if workspace_index is None or not workspace_index.is_built:
+        return "Error: No workspace index. Call load_report first."
+
+    entries = workspace_index.symbols.find(symbol_name)
+    if not entries:
+        return f"Symbol `{symbol_name}` not found in workspace index."
+
+    result = f"## Cross-File Impact — `{symbol_name}`\n\n"
+
+    # Declarations and definitions
+    defs = [e for e in entries if e.kind.endswith("_def")]
+    decls = [e for e in entries if e.kind.endswith("_decl")]
+    others = [e for e in entries if not e.kind.endswith("_def") and not e.kind.endswith("_decl")]
+
+    if defs:
+        result += "### Definitions\n"
+        for e in defs:
+            result += f"- `{e.file}:{e.line}` ({e.linkage}): `{e.signature}`\n"
+        result += "\n"
+
+    if decls:
+        result += "### Declarations\n"
+        for e in decls:
+            result += f"- `{e.file}:{e.line}` ({e.linkage}): `{e.signature}`\n"
+        result += "\n"
+
+    if others:
+        result += "### Other References\n"
+        for e in others:
+            result += f"- `{e.file}:{e.line}` ({e.kind}): `{e.signature}`\n"
+        result += "\n"
+
+    # Callers
+    callers = workspace_index.call_graph.get_callers(symbol_name)
+    if callers:
+        result += f"### Callers ({len(callers)})\n"
+        for c in callers[:20]:
+            result += f"- `{c.caller_file}:{c.caller_line}` in `{c.caller_function}()`\n"
+        if len(callers) > 20:
+            result += f"- ... and {len(callers) - 20} more\n"
+        result += "\n"
+
+    # Files affected
+    files = set(e.file for e in entries) | set(c.caller_file for c in callers)
+    result += f"### Total Files Affected: {len(files)}\n"
+    for f in sorted(files):
+        result += f"- `{f}`\n"
+
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════
