@@ -432,6 +432,87 @@ class TestEdgeCases(unittest.TestCase):
         resolved = graph._resolve_quoted("nonexistent.h", "main.c")
         self.assertIsNone(resolved)
 
+# ═══════════════════════════════════════════════════════════════════════
+#  Header (.h) File Analysis
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestHeaderFileAnalysis(unittest.TestCase):
+    """Dedicated tests for .h file parsing, indexing, and analysis."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.index = WorkspaceIndex(MOCK_PROJECT)
+        cls.index.build()
+        cls.analyzer = CAnalyzer(MOCK_PROJECT, workspace_index=cls.index)
+
+    # ── File discovery ──
+
+    def test_h_files_discovered(self):
+        """Both .h files should be discovered by workspace index."""
+        summary = self.index.get_summary()
+        self.assertEqual(summary["h_files"], 2)
+
+    def test_h_files_in_file_list(self):
+        """utils.h and config.h should appear in the indexed file list."""
+        files = self.index._files
+        h_files = [f for f in files if f.endswith(".h")]
+        self.assertEqual(len(h_files), 2)
+        basenames = sorted(os.path.basename(f) for f in h_files)
+        self.assertEqual(basenames, ["config.h", "utils.h"])
+
+    # ── Declarations from headers ──
+
+    def test_all_function_decls_from_utils_h(self):
+        """All 5 function declarations in utils.h should be indexed."""
+        expected = {"add_numbers", "multiply_values", "process_data",
+                    "compute_sum", "public_function"}
+        decls = self.index.symbols.find_declarations
+        found = set()
+        for name in expected:
+            entries = [e for e in self.index.symbols.find(name)
+                       if e.file.endswith("utils.h") and e.kind == "function_decl"]
+            if entries:
+                found.add(name)
+        self.assertEqual(found, expected,
+                         f"Missing declarations from utils.h: {expected - found}")
+
+    def test_macro_from_config_h(self):
+        """APP_VERSION and DEBUG_ENABLED macros from config.h should be indexed."""
+        for macro_name in ("APP_VERSION", "DEBUG_ENABLED"):
+            entries = self.index.symbols.find(macro_name)
+            config_entries = [e for e in entries
+                              if e.file.endswith("config.h") and e.kind == "macro"]
+            self.assertGreater(len(config_entries), 0,
+                               f"{macro_name} not found in config.h")
+
+    def test_typedef_from_config_h(self):
+        """error_code_t typedef from config.h should be indexed and resolvable."""
+        entries = self.index.symbols.find("error_code_t")
+        config_entries = [e for e in entries if e.file.endswith("config.h")]
+        self.assertGreater(len(config_entries), 0)
+        # Also check type resolution
+        resolved = self.index.types.resolve("error_code_t")
+        self.assertIn("int", resolved.lower())
+
+    def test_struct_tag_from_utils_h(self):
+        """DataPoint struct tag from utils.h should be indexed."""
+        entries = self.index.symbols.find("DataPoint")
+        h_entries = [e for e in entries if e.file.endswith("utils.h")]
+        self.assertGreater(len(h_entries), 0, "DataPoint struct not found in utils.h")
+
+    # ── CAnalyzer on .h files ──
+
+    def test_analyzer_parses_header(self):
+        """CAnalyzer.analyze_for_rule should work on .h files."""
+        result = self.analyzer.analyze_for_rule("utils.h", 7, "MisraC2012-8.2")
+        self.assertEqual(result["rule_id"], "MisraC2012-8.2")
+        # Should not crash, and should have parsed the file
+
+    def test_analyzer_find_declarations_in_header(self):
+        """CAnalyzer.find_declarations should find declarations in utils.h."""
+        decls = self.analyzer.find_declarations("utils.h", "add_numbers")
+        self.assertGreaterEqual(len(decls), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
