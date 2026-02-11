@@ -15,6 +15,7 @@ Each issue is normalised into an AxivionViolation dataclass.
 
 import json
 import logging
+import os
 from typing import List, Dict, Optional
 from pydantic import BaseModel
 
@@ -173,11 +174,66 @@ class AxivionParser:
         )
 
     # ────────────────────────────────────────────────────────────────
+    #  Path normalisation
+    # ────────────────────────────────────────────────────────────────
+
+    def normalize_paths(self, workspace_root: str) -> None:
+        """
+        Normalise violation file paths to be relative to workspace_root.
+
+        Axivion reports may contain absolute paths from the analysis server
+        (e.g. /opt/axivion/checkout/src/main.c) that don't match the user's
+        workspace.  This method strips any prefix so that paths become
+        workspace-relative (e.g. src/main.c).
+        """
+        ws = os.path.abspath(workspace_root)
+        for v in self.violations:
+            fp = v.file_path
+            # Already relative and exists in workspace — leave it
+            if not os.path.isabs(fp):
+                if os.path.isfile(os.path.join(ws, fp)):
+                    continue
+
+            # Absolute path that starts with workspace root
+            abs_fp = os.path.abspath(fp) if os.path.isabs(fp) else fp
+            if abs_fp.startswith(ws + os.sep):
+                v.file_path = os.path.relpath(abs_fp, ws)
+                continue
+
+            # Try to match by finding the longest suffix that exists in workspace
+            parts = fp.replace("\\", "/").split("/")
+            for i in range(len(parts)):
+                candidate = os.path.join(*parts[i:])
+                if os.path.isfile(os.path.join(ws, candidate)):
+                    v.file_path = candidate
+                    break
+
+        logger.info(
+            "Normalised %d violation paths against workspace %s",
+            len(self.violations), workspace_root,
+        )
+
+    # ────────────────────────────────────────────────────────────────
     #  Queries
     # ────────────────────────────────────────────────────────────────
 
     def get_violations_by_file(self, file_path: str) -> List[AxivionViolation]:
-        return [v for v in self.violations if v.file_path == file_path]
+        """Get violations for a file, using suffix matching for robustness."""
+        # Normalise separators
+        query = file_path.replace("\\", "/").rstrip("/")
+        results = []
+        for v in self.violations:
+            vp = v.file_path.replace("\\", "/").rstrip("/")
+            # Exact match
+            if vp == query:
+                results.append(v)
+            # Suffix match: query "src/main.c" matches "/opt/.../src/main.c"
+            elif vp.endswith("/" + query) or query.endswith("/" + vp):
+                results.append(v)
+            # Basename match as last resort (only if unique enough: has dir)
+            elif "/" not in query and os.path.basename(vp) == query:
+                results.append(v)
+        return results
 
     def get_violation_by_id(self, rule_id: str) -> List[AxivionViolation]:
         return [v for v in self.violations if v.rule_id == rule_id]

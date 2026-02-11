@@ -63,6 +63,12 @@ def load_report(report_path: str, workspace_root: str) -> str:
 
     try:
         parser = AxivionParser(report_path)
+
+        # Normalise violation paths to be relative to the workspace.
+        # Axivion reports may contain absolute paths from the analysis server
+        # that differ from the user's local workspace layout.
+        parser.normalize_paths(workspace_root)
+
         context_provider = ContextProvider(workspace_root)
 
         # Build cross-file index
