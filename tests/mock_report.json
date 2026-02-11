@@ -1,0 +1,609 @@
+{
+    "issues": [
+        {
+            "ruleId": "MisraC2012-2.1",
+            "message": "Unreachable code after all branches return.",
+            "location": {
+                "path": "tests/mock_code_rule2x.c",
+                "startLine": 18,
+                "endLine": 18
+            },
+            "severity": "high",
+            "description": "A project shall not contain unreachable code."
+        },
+        {
+            "ruleId": "MisraC2012-2.1",
+            "message": "Unreachable code after infinite loop.",
+            "location": {
+                "path": "tests/mock_code_rule2x.c",
+                "startLine": 26,
+                "endLine": 26
+            },
+            "severity": "high",
+            "description": "A project shall not contain unreachable code."
+        },
+        {
+            "ruleId": "MisraC2012-2.1",
+            "message": "Unreachable code after exhaustive switch.",
+            "location": {
+                "path": "tests/mock_code_rule2x.c",
+                "startLine": 39,
+                "endLine": 39
+            },
+            "severity": "high",
+            "description": "A project shall not contain unreachable code."
+        },
+        {
+            "ruleId": "MisraC2012-2.2",
+            "message": "Expression result is not used (dead code).",
+            "location": {
+                "path": "tests/mock_code_rule2x.c",
+                "startLine": 47,
+                "endLine": 47
+            },
+            "severity": "medium",
+            "description": "There shall be no dead code."
+        },
+        {
+            "ruleId": "MisraC2012-2.2",
+            "message": "Variable modified but never subsequently read.",
+            "location": {
+                "path": "tests/mock_code_rule2x.c",
+                "startLine": 60,
+                "endLine": 60
+            },
+            "severity": "medium",
+            "description": "There shall be no dead code."
+        },
+        {
+            "ruleId": "MisraC2012-2.3",
+            "message": "Type 'UnusedLocalPoint' is declared but not used.",
+            "location": {
+                "path": "tests/mock_code_rule2x.c",
+                "startLine": 69,
+                "endLine": 72
+            },
+            "severity": "low",
+            "description": "A project should not contain unused type declarations."
+        },
+        {
+            "ruleId": "MisraC2012-2.3",
+            "message": "Type 'UnusedFileType' is declared but not used.",
+            "location": {
+                "path": "tests/mock_code_rule2x.c",
+                "startLine": 76,
+                "endLine": 76
+            },
+            "severity": "low",
+            "description": "A project should not contain unused type declarations."
+        },
+        {
+            "ruleId": "MisraC2012-2.4",
+            "message": "Tag 'UnusedTag' declared but never used.",
+            "location": {
+                "path": "tests/mock_code_rule2x.c",
+                "startLine": 81,
+                "endLine": 84
+            },
+            "severity": "low",
+            "description": "A project should not contain unused tag declarations."
+        },
+        {
+            "ruleId": "MisraC2012-2.4",
+            "message": "Tag 'UnusedColorTag' declared but never used.",
+            "location": {
+                "path": "tests/mock_code_rule2x.c",
+                "startLine": 88,
+                "endLine": 92
+            },
+            "severity": "low",
+            "description": "A project should not contain unused tag declarations."
+        },
+        {
+            "ruleId": "MisraC2012-2.5",
+            "message": "Macro 'UNUSED_MACRO_BUFFER_SIZE' is defined but never expanded.",
+            "location": {
+                "path": "tests/mock_code_rule2x.c",
+                "startLine": 96,
+                "endLine": 96
+            },
+            "severity": "low",
+            "description": "A project should not contain unused macro declarations."
+        },
+        {
+            "ruleId": "MisraC2012-2.5",
+            "message": "Macro 'TEMP_MACRO' is defined and immediately undefined without expansion.",
+            "location": {
+                "path": "tests/mock_code_rule2x.c",
+                "startLine": 99,
+                "endLine": 99
+            },
+            "severity": "low",
+            "description": "A project should not contain unused macro declarations."
+        },
+        {
+            "ruleId": "MisraC2012-2.6",
+            "message": "Label 'cleanup' is declared but not referenced by any goto.",
+            "location": {
+                "path": "tests/mock_code_rule2x.c",
+                "startLine": 109,
+                "endLine": 109
+            },
+            "severity": "medium",
+            "description": "A function should not contain unused label declarations."
+        },
+        {
+            "ruleId": "MisraC2012-2.6",
+            "message": "Label 'unused_label' is declared but not targeted by any goto.",
+            "location": {
+                "path": "tests/mock_code_rule2x.c",
+                "startLine": 117,
+                "endLine": 117
+            },
+            "severity": "medium",
+            "description": "A function should not contain unused label declarations."
+        },
+        {
+            "ruleId": "MisraC2012-2.7",
+            "message": "Parameters 'unused_a', 'unused_b' are never referenced.",
+            "location": {
+                "path": "tests/mock_code_rule2x.c",
+                "startLine": 126,
+                "endLine": 126
+            },
+            "severity": "medium",
+            "description": "There should be no unused parameters in functions."
+        },
+        {
+            "ruleId": "MisraC2012-2.7",
+            "message": "Parameters 'a', 'b', 'c' are never referenced.",
+            "location": {
+                "path": "tests/mock_code_rule2x.c",
+                "startLine": 132,
+                "endLine": 132
+            },
+            "severity": "medium",
+            "description": "There should be no unused parameters in functions."
+        },
+        {
+            "ruleId": "MisraC2012-8.1",
+            "message": "Function has no explicit return type (implicit int).",
+            "location": {
+                "path": "tests/mock_code_rule8x.c",
+                "startLine": 12,
+                "endLine": 12
+            },
+            "severity": "high",
+            "description": "Types shall be explicitly specified."
+        },
+        {
+            "ruleId": "MisraC2012-8.1",
+            "message": "Parameter 'x' has no type specifier in old-style definition.",
+            "location": {
+                "path": "tests/mock_code_rule8x.c",
+                "startLine": 19,
+                "endLine": 19
+            },
+            "severity": "high",
+            "description": "Types shall be explicitly specified."
+        },
+        {
+            "ruleId": "MisraC2012-8.2",
+            "message": "Function prototype parameters are not named.",
+            "location": {
+                "path": "tests/mock_code_rule8x.c",
+                "startLine": 28,
+                "endLine": 28
+            },
+            "severity": "medium",
+            "description": "Function types shall be in prototype form with named parameters."
+        },
+        {
+            "ruleId": "MisraC2012-8.2",
+            "message": "Empty parentheses used instead of (void).",
+            "location": {
+                "path": "tests/mock_code_rule8x.c",
+                "startLine": 33,
+                "endLine": 33
+            },
+            "severity": "medium",
+            "description": "Function types shall be in prototype form with named parameters."
+        },
+        {
+            "ruleId": "MisraC2012-8.3",
+            "message": "const qualifier missing in definition vs. declaration.",
+            "location": {
+                "path": "tests/mock_code_rule8x.c",
+                "startLine": 39,
+                "endLine": 39
+            },
+            "severity": "high",
+            "description": "All declarations of an object or function shall use the same names and type qualifiers."
+        },
+        {
+            "ruleId": "MisraC2012-8.3",
+            "message": "Parameter names differ between declaration and definition.",
+            "location": {
+                "path": "tests/mock_code_rule8x.c",
+                "startLine": 43,
+                "endLine": 43
+            },
+            "severity": "high",
+            "description": "All declarations of an object or function shall use the same names and type qualifiers."
+        },
+        {
+            "ruleId": "MisraC2012-8.4",
+            "message": "No prior compatible declaration visible for externally linked function.",
+            "location": {
+                "path": "tests/mock_code_rule8x.c",
+                "startLine": 50,
+                "endLine": 50
+            },
+            "severity": "medium",
+            "description": "A compatible declaration shall be visible when an object or function with external linkage is defined."
+        },
+        {
+            "ruleId": "MisraC2012-8.5",
+            "message": "Duplicate extern declaration in same translation unit.",
+            "location": {
+                "path": "tests/mock_code_rule8x.c",
+                "startLine": 58,
+                "endLine": 58
+            },
+            "severity": "medium",
+            "description": "An external object or function shall be declared once in one and only one file."
+        },
+        {
+            "ruleId": "MisraC2012-8.6",
+            "message": "Multiple tentative definitions of 'rule_8_6_tentative'.",
+            "location": {
+                "path": "tests/mock_code_rule8x.c",
+                "startLine": 65,
+                "endLine": 65
+            },
+            "severity": "high",
+            "description": "An identifier with external linkage shall have exactly one external definition."
+        },
+        {
+            "ruleId": "MisraC2012-8.7",
+            "message": "extern declaration at block scope.",
+            "location": {
+                "path": "tests/mock_code_rule8x.c",
+                "startLine": 71,
+                "endLine": 71
+            },
+            "severity": "medium",
+            "description": "Functions and objects should not be defined at block scope."
+        },
+        {
+            "ruleId": "MisraC2012-8.8",
+            "message": "Function with internal linkage is missing static specifier.",
+            "location": {
+                "path": "tests/mock_code_rule8x.c",
+                "startLine": 78,
+                "endLine": 78
+            },
+            "severity": "medium",
+            "description": "The static storage class specifier shall be used in all declarations of objects and functions that have internal linkage."
+        },
+        {
+            "ruleId": "MisraC2012-8.9",
+            "message": "File-scope variable 'single_use_var' is only accessed in one function.",
+            "location": {
+                "path": "tests/mock_code_rule8x.c",
+                "startLine": 85,
+                "endLine": 85
+            },
+            "severity": "low",
+            "description": "An object should be defined at block scope if its identifier only appears in a single function."
+        },
+        {
+            "ruleId": "MisraC2012-8.10",
+            "message": "Inline function at file scope without static specifier.",
+            "location": {
+                "path": "tests/mock_code_rule8x.c",
+                "startLine": 92,
+                "endLine": 92
+            },
+            "severity": "medium",
+            "description": "An inline function shall be declared with the static storage class."
+        },
+        {
+            "ruleId": "MisraC2012-8.11",
+            "message": "Extern array declared without explicit size.",
+            "location": {
+                "path": "tests/mock_code_rule8x.c",
+                "startLine": 99,
+                "endLine": 99
+            },
+            "severity": "medium",
+            "description": "When an array with external linkage is declared, its size should be explicitly specified."
+        },
+        {
+            "ruleId": "MisraC2012-8.12",
+            "message": "Implicit enumeration constant 'B_VAL' has same value as explicit 'C_VAL'.",
+            "location": {
+                "path": "tests/mock_code_rule8x.c",
+                "startLine": 107,
+                "endLine": 107
+            },
+            "severity": "high",
+            "description": "Within an enumerator list, the value of an implicitly-specified enumeration constant shall be unique."
+        },
+        {
+            "ruleId": "MisraC2012-8.13",
+            "message": "Pointer 'data' could be declared as pointing to const.",
+            "location": {
+                "path": "tests/mock_code_rule8x.c",
+                "startLine": 114,
+                "endLine": 114
+            },
+            "severity": "low",
+            "description": "A pointer should point to a const-qualified type whenever possible."
+        },
+        {
+            "ruleId": "MisraC2012-8.13",
+            "message": "Pointer 'p' could be declared as pointing to const.",
+            "location": {
+                "path": "tests/mock_code_rule8x.c",
+                "startLine": 129,
+                "endLine": 129
+            },
+            "severity": "low",
+            "description": "A pointer should point to a const-qualified type whenever possible."
+        },
+        {
+            "ruleId": "MisraC2012-8.14",
+            "message": "The restrict type qualifier is used.",
+            "location": {
+                "path": "tests/mock_code_rule8x.c",
+                "startLine": 136,
+                "endLine": 136
+            },
+            "severity": "high",
+            "description": "The restrict type qualifier shall not be used."
+        },
+        {
+            "ruleId": "MisraC2012-10.1",
+            "message": "Boolean used as operand of arithmetic addition.",
+            "location": {
+                "path": "tests/mock_code_rule10x.c",
+                "startLine": 14,
+                "endLine": 14
+            },
+            "severity": "high",
+            "description": "Operands shall not be of an inappropriate essential type."
+        },
+        {
+            "ruleId": "MisraC2012-10.1",
+            "message": "Enum used as operand of bitwise operator.",
+            "location": {
+                "path": "tests/mock_code_rule10x.c",
+                "startLine": 23,
+                "endLine": 23
+            },
+            "severity": "high",
+            "description": "Operands shall not be of an inappropriate essential type."
+        },
+        {
+            "ruleId": "MisraC2012-10.1",
+            "message": "Signed value used as operand in left-shift.",
+            "location": {
+                "path": "tests/mock_code_rule10x.c",
+                "startLine": 30,
+                "endLine": 30
+            },
+            "severity": "high",
+            "description": "Operands shall not be of an inappropriate essential type."
+        },
+        {
+            "ruleId": "MisraC2012-10.1",
+            "message": "Essentially character type used in relational comparison.",
+            "location": {
+                "path": "tests/mock_code_rule10x.c",
+                "startLine": 37,
+                "endLine": 37
+            },
+            "severity": "medium",
+            "description": "Operands shall not be of an inappropriate essential type."
+        },
+        {
+            "ruleId": "MisraC2012-10.2",
+            "message": "Character type used in subtraction.",
+            "location": {
+                "path": "tests/mock_code_rule10x.c",
+                "startLine": 47,
+                "endLine": 47
+            },
+            "severity": "medium",
+            "description": "Expressions of essentially character type shall not be used inappropriately in addition and subtraction operations."
+        },
+        {
+            "ruleId": "MisraC2012-10.2",
+            "message": "Character type used in addition with non-character integer.",
+            "location": {
+                "path": "tests/mock_code_rule10x.c",
+                "startLine": 52,
+                "endLine": 52
+            },
+            "severity": "medium",
+            "description": "Expressions of essentially character type shall not be used inappropriately in addition and subtraction operations."
+        },
+        {
+            "ruleId": "MisraC2012-10.2",
+            "message": "Character arithmetic used for array indexing.",
+            "location": {
+                "path": "tests/mock_code_rule10x.c",
+                "startLine": 58,
+                "endLine": 58
+            },
+            "severity": "medium",
+            "description": "Expressions of essentially character type shall not be used inappropriately in addition and subtraction operations."
+        },
+        {
+            "ruleId": "MisraC2012-10.3",
+            "message": "Unsigned int assigned to unsigned short (narrower type).",
+            "location": {
+                "path": "tests/mock_code_rule10x.c",
+                "startLine": 67,
+                "endLine": 67
+            },
+            "severity": "high",
+            "description": "The value of an expression shall not be assigned to an object with a narrower essential type or of a different essential type category."
+        },
+        {
+            "ruleId": "MisraC2012-10.3",
+            "message": "Signed int assigned to unsigned int (sign loss).",
+            "location": {
+                "path": "tests/mock_code_rule10x.c",
+                "startLine": 74,
+                "endLine": 74
+            },
+            "severity": "high",
+            "description": "The value of an expression shall not be assigned to an object with a narrower essential type or of a different essential type category."
+        },
+        {
+            "ruleId": "MisraC2012-10.3",
+            "message": "Float assigned to int (fractional truncation).",
+            "location": {
+                "path": "tests/mock_code_rule10x.c",
+                "startLine": 81,
+                "endLine": 81
+            },
+            "severity": "high",
+            "description": "The value of an expression shall not be assigned to an object with a narrower essential type or of a different essential type category."
+        },
+        {
+            "ruleId": "MisraC2012-10.4",
+            "message": "Signed and unsigned operands in comparison.",
+            "location": {
+                "path": "tests/mock_code_rule10x.c",
+                "startLine": 91,
+                "endLine": 91
+            },
+            "severity": "high",
+            "description": "Both operands of an operator in which the usual arithmetic conversions are performed shall have the same essential type category."
+        },
+        {
+            "ruleId": "MisraC2012-10.4",
+            "message": "Enum and int mixed in ternary operator.",
+            "location": {
+                "path": "tests/mock_code_rule10x.c",
+                "startLine": 100,
+                "endLine": 100
+            },
+            "severity": "medium",
+            "description": "Both operands of an operator in which the usual arithmetic conversions are performed shall have the same essential type category."
+        },
+        {
+            "ruleId": "MisraC2012-10.5",
+            "message": "Signed integer cast to boolean.",
+            "location": {
+                "path": "tests/mock_code_rule10x.c",
+                "startLine": 108,
+                "endLine": 108
+            },
+            "severity": "medium",
+            "description": "The value of an expression should not be cast to an inappropriate essential type."
+        },
+        {
+            "ruleId": "MisraC2012-10.5",
+            "message": "Pointer cast to boolean.",
+            "location": {
+                "path": "tests/mock_code_rule10x.c",
+                "startLine": 114,
+                "endLine": 114
+            },
+            "severity": "medium",
+            "description": "The value of an expression should not be cast to an inappropriate essential type."
+        },
+        {
+            "ruleId": "MisraC2012-10.5",
+            "message": "Unsigned integer cast to enum.",
+            "location": {
+                "path": "tests/mock_code_rule10x.c",
+                "startLine": 120,
+                "endLine": 120
+            },
+            "severity": "medium",
+            "description": "The value of an expression should not be cast to an inappropriate essential type."
+        },
+        {
+            "ruleId": "MisraC2012-10.6",
+            "message": "Composite u16*u16 expression assigned to wider u32.",
+            "location": {
+                "path": "tests/mock_code_rule10x.c",
+                "startLine": 130,
+                "endLine": 131
+            },
+            "severity": "medium",
+            "description": "The value of a composite expression shall not be assigned to an object with wider essential type."
+        },
+        {
+            "ruleId": "MisraC2012-10.6",
+            "message": "Composite u8+u8 expression assigned to wider u16.",
+            "location": {
+                "path": "tests/mock_code_rule10x.c",
+                "startLine": 139,
+                "endLine": 139
+            },
+            "severity": "medium",
+            "description": "The value of a composite expression shall not be assigned to an object with wider essential type."
+        },
+        {
+            "ruleId": "MisraC2012-10.7",
+            "message": "Composite expression (u16+u16) combined with u32 operand.",
+            "location": {
+                "path": "tests/mock_code_rule10x.c",
+                "startLine": 150,
+                "endLine": 150
+            },
+            "severity": "medium",
+            "description": "If a composite expression is used as one operand of an operator in which the usual arithmetic conversions are performed then the other operand shall not have wider essential type."
+        },
+        {
+            "ruleId": "MisraC2012-10.7",
+            "message": "Composite char expression combined with int operand.",
+            "location": {
+                "path": "tests/mock_code_rule10x.c",
+                "startLine": 157,
+                "endLine": 157
+            },
+            "severity": "medium",
+            "description": "If a composite expression is used as one operand of an operator in which the usual arithmetic conversions are performed then the other operand shall not have wider essential type."
+        },
+        {
+            "ruleId": "MisraC2012-10.8",
+            "message": "Unsigned composite expression cast to signed.",
+            "location": {
+                "path": "tests/mock_code_rule10x.c",
+                "startLine": 167,
+                "endLine": 167
+            },
+            "severity": "medium",
+            "description": "The value of a composite expression shall not be cast to a different essential type category."
+        },
+        {
+            "ruleId": "MisraC2012-10.8",
+            "message": "Integer composite cast to float (integer division already truncated).",
+            "location": {
+                "path": "tests/mock_code_rule10x.c",
+                "startLine": 175,
+                "endLine": 175
+            },
+            "severity": "medium",
+            "description": "The value of a composite expression shall not be cast to a different essential type category."
+        },
+        {
+            "ruleId": "MisraC2012-10.8",
+            "message": "Signed composite expression cast to unsigned.",
+            "location": {
+                "path": "tests/mock_code_rule10x.c",
+                "startLine": 185,
+                "endLine": 185
+            },
+            "severity": "medium",
+            "description": "The value of a composite expression shall not be cast to a different essential type category."
+        }
+    ]
+}
