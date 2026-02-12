@@ -22,6 +22,7 @@ from core.axivion_parser import AxivionParser
 from core.context_provider import ContextProvider
 from core.c_analyzer import CAnalyzer
 from core.workspace_index import WorkspaceIndex
+from core.preprocessor import PreprocessorEngine
 from core.misra_knowledge_base import format_rule_explanation, get_rule
 from core.fix_engine import FixEngine
 
@@ -36,6 +37,7 @@ context_provider = None
 analyzer = None
 fix_engine = None
 workspace_index = None
+preprocessor = None
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Tool 1 — Load Report
@@ -54,7 +56,7 @@ def load_report(report_path: str, workspace_root: str) -> str:
         report_path:    Absolute path to the Axivion JSON report.
         workspace_root: Root directory of the workspace containing source code.
     """
-    global parser, context_provider, analyzer, fix_engine, workspace_index
+    global parser, context_provider, analyzer, fix_engine, workspace_index, preprocessor
 
     if not os.path.exists(report_path):
         return f"Error: Report file not found at {report_path}"
@@ -71,20 +73,27 @@ def load_report(report_path: str, workspace_root: str) -> str:
 
         context_provider = ContextProvider(workspace_root)
 
+        # Initialize Preprocessor Engine
+        try:
+            preprocessor = PreprocessorEngine(workspace_root)
+        except Exception as e:
+            return f"Error initializing PreprocessorEngine: {e}"
+
         # Build cross-file index
-        workspace_index = WorkspaceIndex(workspace_root)
+        workspace_index = WorkspaceIndex(workspace_root, preprocessor=preprocessor)
         workspace_index.build()
 
         # Create analyzer with cross-file support
-        analyzer = CAnalyzer(workspace_root, workspace_index=workspace_index)
-        fix_engine = FixEngine(analyzer)
+        analyzer = CAnalyzer(workspace_root, workspace_index=workspace_index, preprocessor=preprocessor)
+        fix_engine = FixEngine(analyzer, context_provider)
 
         count = len(parser.get_all_violations())
         idx = workspace_index.get_summary()
         return (
             f"Successfully loaded report. Found {count} violations.\n"
             f"Workspace indexed: {idx['c_files']} .c files, {idx['h_files']} .h files, "
-            f"{idx['symbols']} symbols, {idx['call_sites']} call sites."
+            f"{idx['symbols']} symbols, {idx['call_sites']} call sites.\n"
+            f"Preprocessor Engine initialized."
         )
     except Exception as e:
         return f"Error loading report: {e}"

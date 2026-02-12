@@ -90,9 +90,10 @@ class EnumConstant:
 class CAnalyzer:
     """AST-based C source file analyzer with optional cross-file support."""
 
-    def __init__(self, workspace_root: str, workspace_index=None):
+    def __init__(self, workspace_root: str, workspace_index=None, preprocessor=None):
         self.workspace_root = workspace_root
         self.index = workspace_index  # Optional WorkspaceIndex for cross-file queries
+        self.preprocessor = preprocessor # Optional PreprocessorEngine
         self._cache: Dict[str, Tuple[bytes, object]] = {}  # path -> (source, tree)
 
     def _resolve(self, file_path: str) -> str:
@@ -553,10 +554,6 @@ class CAnalyzer:
 
         return constants
 
-    # ────────────────────────────────────────────────────────────────
-    #  High-level analysis for specific MISRA rules
-    # ────────────────────────────────────────────────────────────────
-
     def analyze_for_rule(self, file_path: str, line: int, rule_id: str) -> Dict:
         """
         Run rule-specific AST analysis and return structured findings.
@@ -601,6 +598,20 @@ class CAnalyzer:
 
         if rule_id == "MisraC2012-2.1":
             reason = self.is_unreachable(file_path, line)
+            
+            # Additional preprocessor check: is the line inside an inactive block?
+            # e.g. #if 0 ... #endif
+            if self.preprocessor:
+                active_regions = self.preprocessor.get_active_regions(file_path)
+                # active_regions is list of (start, end) inclusive
+                is_active = False
+                for start, end in active_regions:
+                    if start <= line <= end:
+                        is_active = True
+                        break
+                if not is_active:
+                    reason = "Code is inside an inactive preprocessor block (e.g. #if 0)"
+            
             analysis["unreachable_reason"] = reason
 
         elif rule_id == "MisraC2012-2.7" and fn:

@@ -41,9 +41,9 @@ class TestWorkspaceIndexBuild(unittest.TestCase):
     def test_file_discovery(self):
         """All .c and .h files should be discovered."""
         summary = self.index.get_summary()
-        self.assertEqual(summary["c_files"], 3, "Should find 3 .c files")
+        self.assertEqual(summary["c_files"], 4, "Should find 4 .c files")
         self.assertEqual(summary["h_files"], 2, "Should find 2 .h files")
-        self.assertEqual(summary["files_indexed"], 5, "Total 5 files")
+        self.assertEqual(summary["files_indexed"], 6, "Total 6 files")
 
     def test_symbols_indexed(self):
         """Should index a meaningful number of symbols."""

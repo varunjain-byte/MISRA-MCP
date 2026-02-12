@@ -13,6 +13,7 @@ An MCP (Model Context Protocol) server that turns GitHub Copilot into a **MISRA 
 
 | Capability | Description |
 |-----------|-------------|
+| **Preprocessor Support** | Handles macro expansion and conditional compilation (`#ifdef`) before analysis, ensuring accurate symbol resolution and dead code elimination |
 | **Report parsing** | Auto-detects multiple Axivion JSON formats (`issues`, `findings`, `warnings`, `results`, bare arrays) |
 | **Cross-file AST analysis** | tree-sitter-powered workspace indexing: include graph, symbol table, call graph, typedef registry |
 | **Rule knowledge base** | 29 MISRA C:2012 rules (2.x, 8.x, 10.x) with rationale, compliant/non-compliant examples, and fix strategies |
@@ -220,9 +221,8 @@ Each issue can use various key names — the parser normalises them:
 
 | Limitation | Detail |
 |-----------|--------|
-| **No macro expansion** | tree-sitter parses source as-is without running the C preprocessor. Code inside `#ifdef` blocks is parsed but conditional compilation logic is not evaluated. |
-| **Conditional code** | Symbols defined in `#if 0` blocks are still indexed. False positives may occur for code that is conditionally compiled out. |
-| **Complex macros** | Function-like macros (e.g. `#define FOO(x) do { ... } while(0)`) are recorded as macro definitions but their expansion is not tracked at call sites. |
+| **Macro debugging** | Violations found within a macro expansion are mapped back to the macro usage site. Complex multi-line macros may require manual inspection of the expanded code functionality. |
+| **Partial Config** | The preprocessor uses a default configuration. Project-specific defines must be inferred or passed via `include_dirs`. |
 
 ### Cross-File Analysis
 

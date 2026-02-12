@@ -454,8 +454,9 @@ class WorkspaceIndex:
         callers = index.call_graph.get_callers("myFunction")
     """
 
-    def __init__(self, workspace_root: str, include_dirs: Optional[List[str]] = None):
+    def __init__(self, workspace_root: str, include_dirs: Optional[List[str]] = None, preprocessor=None):
         self.workspace_root = workspace_root
+        self.preprocessor = preprocessor
         self.include_graph = IncludeGraph(workspace_root, include_dirs)
         self.symbols = SymbolTable()
         self.call_graph = CallGraph()
@@ -669,39 +670,253 @@ class WorkspaceIndex:
         full_path = os.path.join(self.workspace_root, rel_path)
         try:
             with open(full_path, "rb") as f:
-                source = f.read()
+                original_source = f.read()
         except Exception as e:
             logger.error("Cannot read %s: %s", rel_path, e)
             return
 
         # Skip binary
-        if b"\x00" in source[:8192]:
+        if b"\x00" in original_source[:8192]:
             return
 
-        tree = _parser.parse(source)
-        root = tree.root_node
+        # 1. Parse ORIGINAL source for macros and basic structure
+        #    (We always need original source for macros, as pcpp consumes them)
+        try:
+            tree = _parser.parse(original_source)
+            root = tree.root_node
+            
+            # Extract macros (preprocessor lines — tree-sitter gives us preproc_def)
+            for macro_node in _walk_type(root, "preproc_def"):
+                self._index_macro(macro_node, original_source, rel_path)
+        except Exception as e:
+            logger.error("Failed to parse original %s: %s", rel_path, e)
 
-        # Extract symbols from all nodes (recursing into preprocessor blocks)
-        self._walk_and_index(root, source, rel_path)
+        # 2. Parse source for Symbols and Calls
+        #    If preprocessor is available, use expanded source for accuracy
+        #    Otherwise fall back to original source
+        
+        target_source = original_source
+        use_mapping = False
+        
+        if self.preprocessor and rel_path.endswith(".c"):
+            try:
+                # Use workspace root as include dir, plus explicit include dirs if we knew them.
+                # WorkspaceIndex doesn't strictly track include dirs configuration per file.
+                # We assume relative paths from workspace root work or are standard.
+                expanded, _ = self.preprocessor.preprocess(rel_path, include_dirs=["."])
+                if expanded and len(expanded.strip()) > 0:
+                    target_source = expanded
+                    use_mapping = True
+            except Exception as e:
+                logger.warning("Preprocessing failed for %s, falling back to raw: %s", rel_path, e)
 
-        # Extract call sites from function bodies
-        for fn_node in _walk_type(root, "function_definition"):
-            body = _find_child(fn_node, "compound_statement")
-            if body is None:
-                continue
-            fn_decl = _find_child(fn_node, "function_declarator")
-            fn_name = "<unknown>"
-            if fn_decl:
-                ident = _find_child(fn_decl, "identifier")
-                if ident:
-                    fn_name = _node_text(ident, source)
+        try:
+            tree = _parser.parse(target_source)
+            root = tree.root_node
+            
+            # Extract symbols and calls
+            # We must be careful: if using expanded source, it contains content from included files!
+            # We must only index nodes that map back to THIS file.
+            
+            self._walk_and_index_symbols_calls(root, target_source, rel_path, use_mapping)
 
-            for call_node in _walk_type(body, "call_expression"):
-                self._index_call(call_node, source, rel_path, fn_name)
+        except Exception as e:
+            logger.error("Failed to parse target source for %s: %s", rel_path, e)
 
-        # Extract macros (preprocessor lines — tree-sitter gives us preproc_def)
-        for macro_node in _walk_type(root, "preproc_def"):
-            self._index_macro(macro_node, source, rel_path)
+    def _walk_and_index_symbols_calls(self, node: Node, source: bytes, rel_path: str, use_mapping: bool):
+        """Walk AST and index symbols/calls, filtering by file origin if mapped."""
+        # Simplified walker that iterates over children
+        for child in node.children:
+             self._process_node(child, source, rel_path, use_mapping)
+
+    def _process_node(self, node: Node, source: bytes, rel_path: str, use_mapping: bool):
+        
+        # Check if node belongs to this file
+        effective_line = node.start_point[0] + 1
+        
+        if use_mapping:
+            # We check the start line
+            orig_file, orig_line = self.preprocessor.get_original_location(rel_path, effective_line)
+            
+            # If the node comes from another file (include), SKIP IT
+            # We only index what is defined IN THIS FILE
+            if orig_file != rel_path:
+                return
+            effective_line = orig_line
+
+        # ── Function Definitions ──
+        if node.type == "function_definition":
+            self._index_function_def(node, source, rel_path, effective_line, use_mapping)
+            return
+
+        # ── Type Definitions ──
+        if node.type == "type_definition":
+            self._index_typedef(node, source, rel_path, line_override=effective_line)
+            return
+
+        # ── Declarations ──
+        if node.type == "declaration":
+            self._index_declaration(node, source, rel_path, effective_line)
+            return
+            
+        # ── Struct/Union/Enum tags ──
+        if node.type in ("struct_specifier", "union_specifier", "enum_specifier"):
+            self._index_struct_union_enum(node, source, rel_path, effective_line)
+            return
+
+        # Recursive walk for other containers if necessary?
+        if node.type in self._PREPROC_CONTAINERS or node.type == "translation_unit":
+             for child in node.children:
+                 self._process_node(child, source, rel_path, use_mapping)
+
+    def _index_function_def(self, node: Node, source: bytes, rel_path: str, line: int, use_mapping: bool):
+        decl = _find_child(node, "function_declarator")
+        if decl is None: return
+        ident = _find_child(decl, "identifier")
+        if ident is None: return
+
+        name = _node_text(ident, source)
+        sig = _node_text(node, source).split("{")[0].strip()
+        linkage = _extract_linkage(node, source)
+        params = _extract_param_types(decl, source)
+
+        self.symbols.add(SymbolEntry(
+            name=name, file=rel_path,
+            line=line,
+            kind="function_def", linkage=linkage,
+            signature=sig, params=params,
+        ))
+        
+        # Index call sites in body
+        body = _find_child(node, "compound_statement")
+        if body:
+            self._index_function_body(body, source, rel_path, name, use_mapping)
+
+    def _index_function_body(self, body_node: Node, source: bytes, rel_path: str, caller_name: str, use_mapping: bool):
+        # Walk for call_expressions efficiently
+        to_visit = [body_node]
+        while to_visit:
+            curr = to_visit.pop()
+            if curr.type == "call_expression":
+                # Index call
+                func_node = curr.child_by_field_name("function")
+                if func_node:
+                    callee = _node_text(func_node, source)
+                    c_line = curr.start_point[0] + 1
+                    
+                    # Count arguments
+                    arg_list = curr.child_by_field_name("arguments")
+                    arg_count = 0
+                    if arg_list:
+                        # Count explicit arguments (comma separated usually, but tree-sitter structure)
+                        # Simply counting named children or specific types might be better
+                        # argument_list children are usually ( ) and expressions and commas
+                        for child in arg_list.children:
+                            if child.type not in ("(", ")", ","):
+                                arg_count += 1
+
+                    final_line = c_line
+                    should_index = True
+                    
+                    if use_mapping:
+                        orig_file, orig_line = self.preprocessor.get_original_location(rel_path, c_line)
+                        if orig_file != rel_path:
+                            should_index = False
+                        final_line = orig_line
+                    
+                    if should_index:
+                        self.call_graph.add(CallSite(
+                            caller_file=rel_path,
+                            caller_function=caller_name,
+                            caller_line=final_line,
+                            callee_name=callee,
+                            arg_count=arg_count
+                        ))
+            
+            # Recurse
+            to_visit.extend(curr.children)
+
+    def _index_declaration(self, node: Node, source: bytes, rel_path: str, line: int):
+        text = _node_text(node, source).strip()
+        linkage = _extract_linkage(node, source)
+
+        func_decl = _find_child(node, "function_declarator")
+        if func_decl:
+             ident = _find_child(func_decl, "identifier")
+             if ident:
+                 name = _node_text(ident, source)
+                 params = _extract_param_types(func_decl, source)
+                 self.symbols.add(SymbolEntry(
+                    name=name, file=rel_path, line=line,
+                    kind="function_decl", linkage=linkage,
+                    signature=text, params=params
+                 ))
+        else:
+             # Variable declaration (with or without initializer)
+             # Case 1: init_declarator (int x = 1; or int x;) - wait, int x; is usually just identifier sibling to type
+             
+             init = _find_child(node, "init_declarator")
+             if init:
+                 ident = _find_child(init, "identifier")
+                 if ident:
+                     name = _node_text(ident, source)
+                     # Determine if definition or declaration
+                     has_initializer = any(c.type == "=" for c in init.children)
+                     kind = "variable_decl" if (linkage == "external" and not has_initializer) else "variable_def"
+                     
+                     self.symbols.add(SymbolEntry(
+                        name=name, file=rel_path, line=line,
+                        kind=kind, linkage=linkage,
+                        signature=text
+                     ))
+             else:
+                 # Case 2: Simple declaration: int x; extern int y;
+                 # We look for an identifier that NOT a type_identifier
+                 for child in node.children:
+                     if child.type == "identifier":
+                         name = _node_text(child, source)
+                         kind = "variable_decl" if linkage == "external" else "variable_def"
+                         self.symbols.add(SymbolEntry(
+                            name=name, file=rel_path, line=line,
+                            kind=kind, linkage=linkage,
+                            signature=text
+                         ))
+                         break
+
+    def _index_struct_union_enum(self, node: Node, source: bytes, rel_path: str, line: int):
+        tag = _find_child(node, "type_identifier")
+        if tag is None:
+            tag = _find_child(node, "identifier")
+        if tag:
+            tag_name = _node_text(tag, source)
+            kind_map = {
+                "struct_specifier": "struct_tag",
+                "union_specifier": "union_tag",
+                "enum_specifier": "enum_tag",
+            }
+            self.symbols.add(SymbolEntry(
+                name=tag_name, file=rel_path,
+                line=line,
+                kind=kind_map.get(node.type, "struct_tag"),
+                linkage="none",
+                signature=_node_text(node, source).split("{")[0].strip(),
+            ))
+
+        # Enum constants
+        if node.type == "enum_specifier":
+            body = _find_child(node, "enumerator_list")
+            if body:
+                for child in body.children:
+                    if child.type == "enumerator":
+                        ident = _find_child(child, "identifier")
+                        if ident:
+                            self.symbols.add(SymbolEntry(
+                                name=_node_text(ident, source),
+                                file=rel_path,
+                                line=child.start_point[0] + 1,
+                                kind="enum_const", linkage="none",
+                                signature=_node_text(child, source),
+                            ))
 
     def _walk_and_index(self, node: Node, source: bytes, rel_path: str):
         """Walk AST and index symbols, recursing into preprocessor blocks."""
@@ -870,9 +1085,10 @@ class WorkspaceIndex:
                                     signature=_node_text(child, source),
                                 ))
 
-    def _index_typedef(self, node: Node, source: bytes, rel_path: str):
+    def _index_typedef(self, node: Node, source: bytes, rel_path: str, line_override: Optional[int] = None):
         """Extract typedef alias → resolved type."""
         text = _node_text(node, source).strip().rstrip(";")
+        line = line_override if line_override is not None else (node.start_point[0] + 1)
 
         # Find the typedef name (last identifier in the declaration)
         identifiers = []
@@ -889,13 +1105,13 @@ class WorkspaceIndex:
 
         self.symbols.add(SymbolEntry(
             name=alias_name, file=rel_path,
-            line=node.start_point[0] + 1,
+            line=line,
             kind="typedef", linkage="none",
             signature=text,
         ))
         self.types.add(TypeAlias(
             alias=alias_name, resolved=resolved,
-            file=rel_path, line=node.start_point[0] + 1,
+            file=rel_path, line=line,
         ))
 
     def _index_call(self, call_node: Node, source: bytes,
