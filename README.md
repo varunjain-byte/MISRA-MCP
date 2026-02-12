@@ -199,7 +199,7 @@ The parser auto-detects these structures:
 ```
 
 Each issue can use various key names — the parser normalises them:
-- **Rule ID**: `ruleId`, `rule_id`, `rule`, `checkId`
+- **Rule ID**: `ruleId`, `rule_id`, `rule`, `checkId`, `errorNumber`
 - **File path**: `location.path`, `location.file`, `file`, `path`
 - **Line number**: `location.startLine`, `location.line`, `line`, `startLine`
 - **Severity**: `severity`, `priority`, `level`
@@ -221,7 +221,7 @@ Each issue can use various key names — the parser normalises them:
 
 | Limitation | Detail |
 |-----------|--------|
-| **Macro debugging** | Violations found within a macro expansion are mapped back to the macro usage site. Complex multi-line macros may require manual inspection of the expanded code functionality. |
+| **Macro debugging** | Violations in macros are analyzed by parsing the macro body as an expression. Complex multi-line macros may still require manual verification of the expanded code. |
 | **Partial Config** | The preprocessor uses a default configuration. Project-specific defines must be inferred or passed via `include_dirs`. |
 
 ### Cross-File Analysis

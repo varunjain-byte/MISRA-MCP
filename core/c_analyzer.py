@@ -684,6 +684,18 @@ class CAnalyzer:
             if self.index and self.index.is_built:
                 analysis["cross_file"] = self.index.check_rule_8_13(fn.name)
 
+        elif rule_id.startswith("MisraC2012-10."):
+            # Expression/Type rules
+            # First, check if this line is a macro definition
+            macro_analysis = self._analyze_macro_definition(file_path, line)
+            if macro_analysis:
+                analysis["macro_analysis"] = macro_analysis
+            else:
+                 # Fallback: try to find an expression at this line in the main tree
+                 expr_analysis = self._analyze_expression_at_line(file_path, line)
+                 if expr_analysis:
+                     analysis["expression_analysis"] = expr_analysis
+
         elif rule_id.startswith("MisraC2012-8."):
             # Generic linkage analysis for remaining 8.x rules
             sym = self._extract_symbol_name(file_path, line)
@@ -696,6 +708,118 @@ class CAnalyzer:
                 ]
 
         return analysis
+
+    def _analyze_macro_definition(self, file_path: str, line: int) -> Optional[Dict]:
+        """
+        If the line is a #define, try to parse its body as an expression.
+        Returns AST analysis of the macro body if successful.
+        """
+        source, tree = self._get_tree(file_path)
+        if tree is None:
+            return None
+
+        # Find the preproc_def node at this line
+        macro_node = None
+        for node in self._walk_all(tree.root_node):
+             if node.start_point[0] + 1 == line and node.type == "preproc_def":
+                 macro_node = node
+                 break
+        
+        if not macro_node:
+             return None
+
+        # Extract macro body: usually the last child is the 'value'
+        # e.g. #define FOO (a + b) -> value is (a + b)
+        # Tree-sitter structure for preproc_def: name, value (preproc_arg)
+        
+        # We need the raw text after the identifier
+        ident = self._find_child(macro_node, "identifier")
+        if not ident:
+             return None
+        
+        # Get everything after the identifier from source
+        macro_text = self._node_text(macro_node, source)
+        ident_text = self._node_text(ident, source)
+        
+        # Basic split to get body
+        parts = macro_text.split(ident_text, 1)
+        if len(parts) < 2:
+            return None
+        
+        body_text = parts[1].strip()
+        if not body_text:
+             return None
+
+        # Wrap in a dummy function to parse as expression
+        # void _dummy() { __MACRO_BODY__; }
+        dummy_source = f"void _dummy() {{ {body_text}; }}"
+        
+        try:
+            dummy_tree = _parser.parse(dummy_source.encode("utf-8"))
+            # Find the expression statement in the dummy tree
+            fn_node = self._find_child(dummy_tree.root_node, "function_definition")
+            if fn_node:
+                body = self._find_child(fn_node, "compound_statement")
+                if body:
+                    # The first child should be our expression statement
+                    stmt = self._find_child(body, "expression_statement")
+                    if stmt:
+                         expr = stmt.children[0] if stmt.children else None
+                         if expr:
+                             # Unwrap parenthesized_expression if present
+                             while expr.type == "parenthesized_expression" and len(expr.children) >= 3:
+                                 # child 1 is the inner expression ( ( expr ) )
+                                 expr = expr.children[1]
+                             return self._analyze_expression_node(expr, dummy_source.encode("utf-8"))
+        except Exception as e:
+            logger.warning("Failed to parse macro body for analysis: %s", e)
+
+        return {"raw_body": body_text}
+
+    def _analyze_expression_at_line(self, file_path: str, line: int) -> Optional[Dict]:
+        """Find the most relevant expression at the given line."""
+        source, tree = self._get_tree(file_path)
+        if not tree:
+            return None
+            
+        # Find the smallest expression node covering the line
+        target = None
+        for node in self._walk_all(tree.root_node):
+            if node.start_point[0] + 1 <= line <= node.end_point[0] + 1:
+                if node.type.endswith("_expression") or node.type in ("identifier", "number_literal", "binary_expression"):
+                     target = node
+        
+        if target:
+             return self._analyze_expression_node(target, source)
+        return None
+
+    def _analyze_expression_node(self, node: Node, source: bytes) -> Dict:
+        """Analyze an expression node for operators and operands."""
+        info = {
+            "type": node.type,
+            "text": self._node_text(node, source),
+            "operator": None,
+            "operands": []
+        }
+        
+        # Binary expression: left OP right
+        if node.type == "binary_expression":
+            # Operator is the child that is not an expression usually
+            # Tree-sitter: left, operator, right
+             if len(node.children) >= 3:
+                 info["left"] = self._node_text(node.children[0], source)
+                 info["operator"] = self._node_text(node.children[1], source)
+                 info["right"] = self._node_text(node.children[2], source)
+                 info["operands"] = [info["left"], info["right"]]
+
+        # Cast expression: (type)value
+        elif node.type == "cast_expression":
+             type_node = self._find_child(node, "type_descriptor")
+             val_node = node.children[-1]
+             info["cast_to"] = self._node_text(type_node, source) if type_node else "?"
+             info["operand"] = self._node_text(val_node, source)
+
+        return info
 
     def _extract_symbol_name(self, file_path: str, line: int) -> Optional[str]:
         """Extract the primary identifier from a line of code."""
