@@ -320,58 +320,100 @@ class FixEngine:
         edits = []
         
         # Rule 10.4: Essential Type Mismatch
-        if rule.rule_id.startswith("MisraC2012-10."):
-            # Check if we have macro analysis or expression analysis
-            # Prefer macro analysis if available
-            root = findings.get("macro_analysis") or findings.get("expression_analysis")
+        if rule.rule_id.startswith("MisraC2012-10.4"):
+            return self._generate_10_4_edits(findings)
+
+        return edits
+
+    def _generate_10_4_edits(self, findings: Dict) -> List[Dict]:
+        """Generate casts to resolve essential type mismatches."""
+        edits = []
+        
+        roots = []
+        if findings.get("macro_analysis"):
+            roots.append(findings["macro_analysis"])
+        if findings.get("expressions"):
+            roots.extend(findings["expressions"])
             
-            if root:
-                # Heuristic: if it's a binary expression, cast the operands?
-                # For 10.4, usually one operand needs casting to match the other.
-                # Simplistic fix: Cast left operand to match right, or vice versa?
-                # Or just cast everything to (uint16_t)? 
-                # Without full type info, we can't be 100% sure which one to cast.
-                # But for the proof of concept with the user's specific case (macro),
-                # we can try to cast the first operand if it looks like a signed constant.
+        if not roots:
+            return []
+            
+        # Helper to determine "Essential Type" category
+        def get_category(t):
+            if t.get("is_float"): return "Floating"
+            if t.get("name") in ("bool", "_Bool"): return "Boolean"
+            if t.get("name") in ("char", "signed char", "unsigned char"): return "Character"
+            if t.get("is_signed"): return "Signed"
+            return "Unsigned"
+
+        for root in roots:
+            operands = root.get("operands", [])
+            if len(operands) < 2:
+                continue
                 
-                # Let's inspect operands
-                operands = root.get("operands", [])
-                if len(operands) >= 2:
-                    left = operands[0]
-                    right = operands[1]
+            left = operands[0]
+            right = operands[1]
+            
+            t_left = left.get("type")
+            t_right = right.get("type")
+            
+            if not t_left or not t_right:
+                continue
+
+            cat_left = get_category(t_left)
+            cat_right = get_category(t_right)
+            
+            if cat_left == cat_right:
+                continue
+                
+            target_op = None
+            cast_type = ""
+            
+            # 1. Signed vs Unsigned -> Cast Signed to Unsigned
+            if cat_left == "Signed" and cat_right == "Unsigned":
+                target_op = left
+                cast_type = f"({t_right['name']})"
+            elif cat_left == "Unsigned" and cat_right == "Signed":
+                target_op = right
+                cast_type = f"({t_left['name']})"
+                
+            # 2. Float vs Integer -> Cast Integer to Float
+            elif cat_left == "Floating" and cat_right != "Floating":
+                target_op = right
+                cast_type = f"({t_left['name']})"
+            elif cat_right == "Floating" and cat_left != "Floating":
+                target_op = left
+                cast_type = f"({t_right['name']})"
+                
+            # 3. Character vs Integer -> Cast Character to Integer
+            elif cat_left == "Character":
+                target_op = left
+                cast_type = f"({t_right['name']})"
+            elif cat_right == "Character":
+                target_op = right
+                cast_type = f"({t_left['name']})"
+                
+            if target_op and cast_type:
+                start = target_op["start_byte"]
+                
+                # Map back if it was a macro
+                if "macro_analysis" in findings and "body_start_byte" in root:
+                    prefix_len = root.get("prefix_len", 0)
+                    body_start = root.get("body_start_byte", 0)
+                    real_start = body_start + (start - prefix_len)
                     
-                    # Assume we want to cast 'left' (often a constant or variable)
-                    # to a standard unsigned type to be safe?
-                    # Better heuristic: if one is 'number_literal', likely it needs a suffix or cast.
-                    # Fix: Insert `(uint16_t)` before left operand.
-                    
-                    target_op = left
-                    
-                    # Offset calculation
-                    start = target_op["start_byte"]
-                    end = target_op["start_byte"] # Insert before
-                    text = "(uint16_t)"
-                    
-                    # Map back if it was a macro
-                    if "macro_analysis" in findings and "body_start_byte" in root:
-                        # Real_offset = body_start + (dummy_offset - prefix_len)
-                        prefix_len = root.get("prefix_len", 0)
-                        body_start = root.get("body_start_byte", 0)
-                        
-                        real_start = body_start + (start - prefix_len)
-                        edits.append({
-                            "start_byte": real_start,
-                            "end_byte": real_start,
-                            "text": text
-                        })
-                    else:
-                        # Normal expression
-                         edits.append({
-                            "start_byte": start,
-                            "end_byte": end,
-                            "text": text
-                        })
-                        
+                    edits.append({
+                        "start_byte": real_start,
+                        "end_byte": real_start,
+                        "text": cast_type
+                    })
+                else:
+                    edits.append({
+                        "start_byte": start,
+                        "end_byte": start,
+                        "text": cast_type
+                    })
+                
         return edits
 
     # ────────────────────────────────────────────────────────────────

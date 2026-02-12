@@ -24,8 +24,102 @@ from tree_sitter import Language, Parser, Node
 logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Tree-sitter setup
+#  Type System
 # ═══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class CType:
+    """Represents a C type with properties relevant for MISRA analysis."""
+    name: str
+    width: int              # heuristic width in bits (e.g. 8, 16, 32, 64)
+    is_signed: bool
+    is_float: bool = False
+    is_pointer: bool = False
+    
+    def __repr__(self):
+        s = "signed" if self.is_signed else "unsigned"
+        if self.is_float: return f"{self.name} (float{self.width})"
+        if self.is_pointer: return f"{self.name} (ptr)"
+        return f"{self.name} ({s} {self.width}-bit)"
+
+class TypeSystem:
+    """
+    Manages C types, standard MISRA essential type models, and arithmetic conversions.
+    """
+    
+    def __init__(self):
+        # Standard primitives (assuming 32-bit int, 64-bit long for analysis)
+        self.types: Dict[str, CType] = {
+            "void":   CType("void", 0, False),
+            "char":   CType("char", 8, True),   # Implementation defined, assume signed for now
+            "signed char": CType("signed char", 8, True),
+            "unsigned char": CType("unsigned char", 8, False),
+            "short":  CType("short", 16, True),
+            "unsigned short": CType("unsigned short", 16, False),
+            "int":    CType("int", 32, True),
+            "unsigned int": CType("unsigned int", 32, False),
+            "unsigned": CType("unsigned int", 32, False),
+            "long":   CType("long", 64, True),
+            "unsigned long": CType("unsigned long", 64, False),
+            "float":  CType("float", 32, True, is_float=True),
+            "double": CType("double", 64, True, is_float=True),
+            "bool":   CType("bool", 1, False),
+            "_Bool":  CType("_Bool", 1, False),
+        }
+        
+        # stdint.h types
+        for w in (8, 16, 32, 64):
+            self.types[f"int{w}_t"] = CType(f"int{w}_t", w, True)
+            self.types[f"uint{w}_t"] = CType(f"uint{w}_t", w, False)
+
+    def get_type(self, type_name: str) -> Optional[CType]:
+        """Resolve a type definition string to a CType."""
+        name = type_name.strip()
+        
+        # Handle pointers roughly
+        if "*" in name:
+            return CType(name, 64, False, is_pointer=True) # Pointers are 64-bit unsigned-ish
+            
+        # Strip common qualifiers
+        cleaned = re.sub(r'\b(const|volatile|static|register|extern)\b', '', name).strip()
+        cleaned = re.sub(r'\s+', ' ', cleaned)
+        
+        return self.types.get(cleaned)
+
+    def get_essential_type(self, type_obj: CType) -> str:
+        """
+        Map to MISRA essential type categories:
+        Boolean, Signed, Unsigned, Floating, Character
+        """
+        if type_obj.name in ("bool", "_Bool"): return "Boolean"
+        if type_obj.is_float: return "Floating"
+        if type_obj.name in ("char", "signed char", "unsigned char"): return "Character"
+        if type_obj.is_signed: return "Signed"
+        return "Unsigned"
+
+    def promote(self, left: CType, right: CType) -> CType:
+        """
+        Determine the result type of a binary operation (Usual Arithmetic Conversions).
+        Simplified for essential type analysis.
+        """
+        if left.is_float or right.is_float:
+            return left if left.width >= right.width else right
+            
+        # Integer promotion rules (simplified)
+        # If one is unsigned and wider or equal, result is unsigned
+        # If both are signed, larger wins
+        
+        l_width, r_width = left.width, right.width
+        
+        if l_width > r_width:
+            return left
+        elif r_width > l_width:
+            return right
+        else:
+            # Equal width: if either is unsigned, result is unsigned
+            if not left.is_signed or not right.is_signed:
+                return CType(f"uint{l_width}_t", l_width, False)
+            return left
 
 C_LANGUAGE = Language(tsc.language())
 _parser = Parser(C_LANGUAGE)
@@ -95,6 +189,7 @@ class CAnalyzer:
         self.index = workspace_index  # Optional WorkspaceIndex for cross-file queries
         self.preprocessor = preprocessor # Optional PreprocessorEngine
         self._cache: Dict[str, Tuple[bytes, object]] = {}  # path -> (source, tree)
+        self.type_system = TypeSystem()
 
     def _resolve(self, file_path: str) -> str:
         """Resolve a (possibly POSIX-style) relative path to an absolute path."""
@@ -691,10 +786,10 @@ class CAnalyzer:
             if macro_analysis:
                 analysis["macro_analysis"] = macro_analysis
             else:
-                 # Fallback: try to find an expression at this line in the main tree
-                 expr_analysis = self._analyze_expression_at_line(file_path, line)
-                 if expr_analysis:
-                     analysis["expression_analysis"] = expr_analysis
+                 # Fallback: try to find expressions at this line in the main tree
+                 expr_list = self._analyze_expression_at_line(file_path, line)
+                 if expr_list:
+                     analysis["expressions"] = expr_list
 
         elif rule_id.startswith("MisraC2012-8."):
             # Generic linkage analysis for remaining 8.x rules
@@ -789,22 +884,40 @@ class CAnalyzer:
 
         return {"raw_body": body_text}
 
-    def _analyze_expression_at_line(self, file_path: str, line: int) -> Optional[Dict]:
-        """Find the most relevant expression at the given line."""
+    def _analyze_expression_at_line(self, file_path: str, line: int) -> List[Dict]:
+        """Find all relevant expressions at the given line."""
         source, tree = self._get_tree(file_path)
         if not tree:
-            return None
+            return []
             
-        # Find the smallest expression node covering the line
-        target = None
-        for node in self._walk_all(tree.root_node):
-            if node.start_point[0] + 1 <= line <= node.end_point[0] + 1:
-                if node.type.endswith("_expression") or node.type in ("identifier", "number_literal", "binary_expression"):
-                     target = node
+        # Find all binary or assignment expressions strictly contained in the line
+        # or covering the line if they are single-line
+        results = []
+        seen = set()
         
-        if target:
-             return self._analyze_expression_node(target, source)
-        return None
+        for node in self._walk_all(tree.root_node):
+            # Check if node is on the target line
+            # node.start_point is (row, col)
+            start_line = node.start_point[0] + 1
+            end_line = node.end_point[0] + 1
+            
+            # We care about nodes that "contain" the violation on this line.
+            # Usually simple expressions are single-line.
+            # If multi-line, we might include them if they start or end on this line?
+            # Let's restrict to nodes identified as expressions on this line.
+            if start_line <= line <= end_line:
+                if node.type in ("binary_expression", "assignment_expression", "cast_expression"):
+                    print(f"DEBUG: Found {node.type} at {start_line}-{end_line}")
+                    # Avoid duplicates (tree walk visits same node once, but avoid logic errors)
+                    if node.id in seen:
+                        continue
+                        
+                    # We want 'significant' expressions.
+                    # _analyze_expression_node handles these types.
+                    seen.add(node.id)
+                    results.append(self._analyze_expression_node(node, source))
+        
+        return results
 
     def _analyze_expression_node(self, node: Node, source: bytes) -> Dict:
         """Analyze an expression node for operators and operands."""
@@ -830,9 +943,22 @@ class CAnalyzer:
                  info["operator"] = self._node_text(op, source)
                  info["right"] = self._node_text(right, source)
                  
+                 t_left = self.get_expression_type(left, source)
+                 t_right = self.get_expression_type(right, source)
+                 
                  info["operands"] = [
-                     {"text": info["left"], "start_byte": left.start_byte, "end_byte": left.end_byte},
-                     {"text": info["right"], "start_byte": right.start_byte, "end_byte": right.end_byte}
+                     {
+                         "text": info["left"], 
+                         "start_byte": left.start_byte, 
+                         "end_byte": left.end_byte,
+                         "type": t_left.__dict__ if t_left else None
+                     },
+                     {
+                         "text": info["right"], 
+                         "start_byte": right.start_byte, 
+                         "end_byte": right.end_byte,
+                         "type": t_right.__dict__ if t_right else None
+                     }
                  ]
 
         # Cast expression: (type)value
@@ -841,13 +967,156 @@ class CAnalyzer:
              val_node = node.children[-1]
              info["cast_to"] = self._node_text(type_node, source) if type_node else "?"
              info["operand"] = self._node_text(val_node, source)
+             
+             t_op = self.get_expression_type(val_node, source)
              info["operands"] = [
-                 {"text": info["operand"], "start_byte": val_node.start_byte, "end_byte": val_node.end_byte}
+                 {
+                     "text": info["operand"], 
+                     "start_byte": val_node.start_byte, 
+                     "end_byte": val_node.end_byte,
+                     "type": t_op.__dict__ if t_op else None
+                 }
              ]
 
         return info
 
-    def _extract_symbol_name(self, file_path: str, line: int) -> Optional[str]:
+    # ────────────────────────────────────────────────────────────────
+    #  Type Inference
+    # ────────────────────────────────────────────────────────────────
+
+    def get_expression_type(self, node: Node, source: bytes) -> Optional[CType]:
+        """Infer the type of an expression node."""
+        if node.type == "number_literal":
+            text = self._node_text(node, source)
+            if "f" in text.lower():
+                return self.type_system.get_type("float")
+            if "u" in text.lower():
+                # Heuristic: verify width based on value?
+                # For now assume minimal fitting unsigned or int
+                return self.type_system.get_type("unsigned int")
+            return self.type_system.get_type("int")
+            
+        if node.type == "string_literal":
+            return CType("char *", 64, False, is_pointer=True)
+            
+        if node.type == "identifier":
+            return self._resolve_identifier_type(node, source)
+            
+        if node.type == "binary_expression":
+            left = node.children[0]
+            right = node.children[2]
+            t_left = self.get_expression_type(left, source)
+            t_right = self.get_expression_type(right, source)
+            
+            if t_left and t_right:
+                return self.type_system.promote(t_left, t_right)
+            return t_left or t_right
+            
+        if node.type == "cast_expression":
+            type_node = self._find_child(node, "type_descriptor")
+            if type_node:
+                type_name = self._node_text(type_node, source)
+                return self.type_system.get_type(type_name)
+
+        if node.type == "parenthesized_expression":
+             # ( expr ) -> type of expr
+             for child in node.children:
+                 if child.type not in ("(", ")"):
+                      return self.get_expression_type(child, source)
+
+        return None
+
+    def _resolve_identifier_type(self, node: Node, source: bytes) -> Optional[CType]:
+        """Find declaration of identifier and return its type."""
+        name = self._node_text(node, source)
+        
+        # 1. Local scope (declaration inside function)
+        # Walk up to find Decl
+        current = node
+        while current:
+            if current.type == "compound_statement":
+                # Scan declarations in this block BEFORE the usage
+                for child in current.children:
+                    if child.end_byte > node.start_byte:
+                        break # passed the usage point
+                    if child.type == "declaration":
+                        # int x;
+                         t = self._extract_type_from_decl(child, name, source)
+                         if t: return t
+            
+            if current.type == "function_definition":
+                # Check parameters
+                declarator = self._find_child(current, "function_declarator")
+                if declarator:
+                    params = self._find_child(declarator, "parameter_list")
+                    if params:
+                        for p in params.children:
+                            if p.type == "parameter_declaration":
+                                t = self._extract_type_from_decl(p, name, source)
+                                if t: return t
+            
+            current = current.parent
+            
+        # 2. File scope (global variables)
+        root = node
+        while root.parent:
+            root = root.parent
+            
+        for child in root.children:
+            if child.type == "declaration":
+                t = self._extract_type_from_decl(child, name, source)
+                if t: return t
+                
+        return None
+
+    def _extract_type_from_decl(self, decl_node: Node, name: str, source: bytes) -> Optional[CType]:
+        """Extract type for 'name' from a declaration node."""
+        # This is a bit complex as C declarations are nested.
+        # Simplified: look for type_identifier and matches of declarator
+        
+        decl_text = self._node_text(decl_node, source)
+        if name not in decl_text:
+            return None
+            
+        # Parse type specifier (int, uint16_t, etc)
+        type_str = "int" # default
+        
+        # Collect type parts
+        parts = []
+        for child in decl_node.children:
+            if child.type in ("primitive_type", "type_identifier", "sized_type_specifier", 
+                              "storage_class_specifier", "type_qualifier"):
+                parts.append(self._node_text(child, source))
+                
+        if parts:
+            type_str = " ".join(parts)
+            
+        # Check if the specific identifier is declared here
+        # (int a, b;)
+        # We need to find the declarator that matches 'name'
+        # to check for pointers/arrays
+        
+        is_ptr = False
+        
+        def find_decl(n):
+            nonlocal is_ptr
+            if n.type == "identifier" and self._node_text(n, source) == name:
+                return True
+            if n.type == "pointer_declarator":
+                if find_decl(n.children[1]):
+                    is_ptr = True
+                    return True
+            if n.type in ("init_declarator", "declaration", "parameter_declaration"):
+                for c in n.children:
+                    if find_decl(c): return True
+            return False
+
+        if find_decl(decl_node):
+             if is_ptr:
+                 type_str += "*"
+             return self.type_system.get_type(type_str)
+             
+        return None
         """Extract the primary identifier from a line of code."""
         lines = self._source_lines(file_path)
         if line > len(lines):
