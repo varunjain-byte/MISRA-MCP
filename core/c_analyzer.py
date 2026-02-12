@@ -750,9 +750,18 @@ class CAnalyzer:
         if not body_text:
              return None
 
+        # Calculate absolute start byte of the body in the source file
+        # ident.end_byte gives us the end of the identifier.
+        # We need to skip whitespace after identifier.
+        current_byte = ident.end_byte
+        while current_byte < len(source) and chr(source[current_byte]).isspace():
+            current_byte += 1
+        body_start_byte = current_byte
+
         # Wrap in a dummy function to parse as expression
         # void _dummy() { __MACRO_BODY__; }
-        dummy_source = f"void _dummy() {{ {body_text}; }}"
+        prefix = "void _dummy() { "
+        dummy_source = f"{prefix}{body_text}; }}"
         
         try:
             dummy_tree = _parser.parse(dummy_source.encode("utf-8"))
@@ -770,7 +779,11 @@ class CAnalyzer:
                              while expr.type == "parenthesized_expression" and len(expr.children) >= 3:
                                  # child 1 is the inner expression ( ( expr ) )
                                  expr = expr.children[1]
-                             return self._analyze_expression_node(expr, dummy_source.encode("utf-8"))
+                             
+                             analysis = self._analyze_expression_node(expr, dummy_source.encode("utf-8"))
+                             analysis["body_start_byte"] = body_start_byte
+                             analysis["prefix_len"] = len(prefix)
+                             return analysis
         except Exception as e:
             logger.warning("Failed to parse macro body for analysis: %s", e)
 
@@ -798,6 +811,8 @@ class CAnalyzer:
         info = {
             "type": node.type,
             "text": self._node_text(node, source),
+            "start_byte": node.start_byte,
+            "end_byte": node.end_byte,
             "operator": None,
             "operands": []
         }
@@ -807,10 +822,18 @@ class CAnalyzer:
             # Operator is the child that is not an expression usually
             # Tree-sitter: left, operator, right
              if len(node.children) >= 3:
-                 info["left"] = self._node_text(node.children[0], source)
-                 info["operator"] = self._node_text(node.children[1], source)
-                 info["right"] = self._node_text(node.children[2], source)
-                 info["operands"] = [info["left"], info["right"]]
+                 left = node.children[0]
+                 op = node.children[1]
+                 right = node.children[2]
+                 
+                 info["left"] = self._node_text(left, source)
+                 info["operator"] = self._node_text(op, source)
+                 info["right"] = self._node_text(right, source)
+                 
+                 info["operands"] = [
+                     {"text": info["left"], "start_byte": left.start_byte, "end_byte": left.end_byte},
+                     {"text": info["right"], "start_byte": right.start_byte, "end_byte": right.end_byte}
+                 ]
 
         # Cast expression: (type)value
         elif node.type == "cast_expression":
@@ -818,6 +841,9 @@ class CAnalyzer:
              val_node = node.children[-1]
              info["cast_to"] = self._node_text(type_node, source) if type_node else "?"
              info["operand"] = self._node_text(val_node, source)
+             info["operands"] = [
+                 {"text": info["operand"], "start_byte": val_node.start_byte, "end_byte": val_node.end_byte}
+             ]
 
         return info
 

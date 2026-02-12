@@ -150,7 +150,13 @@ def analyze_violation(rule_id: str, file_path: str) -> str:
     violations = parser.get_violations_by_file(file_path)
     target = next((v for v in violations if v.rule_id == rule_id), None)
     if not target:
-        return f"Violation {rule_id} not found in {file_path}"
+        available_rules = sorted({v.rule_id for v in violations})
+        msg = f"Violation '{rule_id}' not found in '{file_path}'."
+        if available_rules:
+            msg += f"\nAvailable rules in this file: {', '.join(available_rules)}"
+        else:
+            msg += "\nNo violations found in this file. Check the path or run list_violations."
+        return msg
 
     # Gather context
     context = context_provider.get_code_context(file_path, target.line_number)
@@ -239,10 +245,13 @@ def propose_fix(rule_id: str, file_path: str, line_number: int) -> str:
         None,
     )
     if not target:
-        return (
-            f"No violation {rule_id} found at {file_path}:{line_number}.  "
-            f"Use list_violations to see available violations."
-        )
+        available_rules = sorted({v.rule_id for v in violations})
+        msg = f"Violation '{rule_id}' not found in '{file_path}'."
+        if available_rules:
+            msg += f"\nAvailable rules in this file: {', '.join(available_rules)}"
+        else:
+            msg += "\nNo violations found in this file. Check the path or run list_violations."
+        return msg
 
     # Gather context
     context = context_provider.get_code_context(file_path, line_number)
@@ -319,8 +328,74 @@ def cross_file_impact(symbol_name: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Entry Point
+#  Tool 7 — Apply Fix (Auto-Fix)
 # ═══════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def apply_fix(rule_id: str, file_path: str, line_number: int) -> str:
+    """
+    Automatically applies the suggested fix for a violation if available.
+    
+    Currently supports:
+    - Rule 10.x (Essential Type Mismatch): Inserts casts.
+    
+    Args:
+        rule_id:     The MISRA rule ID.
+        file_path:   The file path.
+        line_number: The line number of the violation.
+    """
+    if parser is None or context_provider is None:
+        return "Error: Not initialised. Call load_report first."
+
+    # Find the matching violation
+    violations = parser.get_violations_by_file(file_path)
+    target = next(
+        (v for v in violations if v.rule_id == rule_id and v.line_number == line_number),
+        None,
+    )
+    if not target:
+        return f"Error: Violation '{rule_id}' not found at {file_path}:{line_number}"
+
+    # Analyze to get edits
+    context = context_provider.get_code_context(file_path, line_number)
+    viol_line = context_provider.get_line(file_path, line_number)
+    # No need for full dependency analysis for apply, just the fix
+    analysis = fix_engine.propose_fix(target, context, viol_line, None)
+    
+    if not analysis.edits:
+        return f"No automated fix available for this violation. Guidance:\n{analysis.fix_guidance}"
+
+    # Apply edits
+    try:
+        abs_path = os.path.join(context_provider.workspace_root, file_path)
+        with open(abs_path, "rb") as f:
+            content = bytearray(f.read())
+        
+        # Sort edits by start_byte descending to keep offsets valid
+        sorted_edits = sorted(analysis.edits, key=lambda e: e["start_byte"], reverse=True)
+        
+        applied_count = 0
+        for edit in sorted_edits:
+            start = edit["start_byte"]
+            end = edit["end_byte"]
+            text = edit["text"].encode("utf-8")
+            
+            # Bounds check
+            if start < 0 or end > len(content) or start > end:
+                continue
+                
+            # Replace [start:end] with text
+            content[start:end] = text
+            applied_count += 1
+            
+        with open(abs_path, "wb") as f:
+            f.write(content)
+            
+        return f"Successfully applied {applied_count} edit(s) to '{file_path}'."
+        
+    except Exception as e:
+        return f"Error applying fix: {e}"
+
 
 if __name__ == "__main__":
     mcp.run()

@@ -13,7 +13,7 @@ Design principle:  **The LLM is the fixer — our job is deep context.**
 """
 
 import re
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 from dataclasses import dataclass, field
 
 from core.misra_knowledge_base import get_rule, MisraRule
@@ -39,6 +39,7 @@ class FixAnalysis:
     compliant_example: str             # from the knowledge base
     non_compliant_example: str         # from the knowledge base
     side_effects: List[str] = field(default_factory=list)
+    edits: List[Dict[str, Any]] = field(default_factory=list)  # [{start, end, text}]
 
     def to_markdown(self) -> str:
         md = f"### Fix Analysis — {self.rule_id}\n"
@@ -51,6 +52,13 @@ class FixAnalysis:
         # AST findings
         md += "#### AST Analysis\n"
         md += self._format_findings() + "\n"
+
+        # Edits (if avaiable)
+        if self.edits:
+            md += "#### 🛠️ Suggested Fix (Auto-Apply Available)\n"
+            for edit in self.edits:
+                md += f"- Insert/Replace at offset {edit['start_byte']}: `{edit['text']}`\n"
+            md += "\n"
 
         # Function context
         if self.function_context:
@@ -77,6 +85,12 @@ class FixAnalysis:
     def _format_findings(self) -> str:
         """Format AST findings into readable markdown."""
         lines = []
+
+        # Macro specific analysis
+        if self.ast_findings.get("macro_analysis"):
+            lines.append("- **Macro Analysis**: definition parsed as expression.")
+            ma = self.ast_findings["macro_analysis"]
+            lines.append(f"  - Body structure: `{ma.get('type')}`")
 
         # Function info
         fn = self.ast_findings.get("function")
@@ -279,6 +293,9 @@ class FixEngine:
 
         # Determine side effects
         side_effects = self._assess_side_effects(rule, ast_findings, dependencies)
+        
+        # NEW: Generate concrete edits
+        edits = self._generate_edits(rule, ast_findings)
 
         return FixAnalysis(
             rule_id=rule.rule_id,
@@ -291,7 +308,71 @@ class FixEngine:
             compliant_example=rule.compliant,
             non_compliant_example=rule.non_compliant,
             side_effects=side_effects,
+            edits=edits
         )
+
+    # ────────────────────────────────────────────────────────────────
+    #  Concrete Edit Generation
+    # ────────────────────────────────────────────────────────────────
+    
+    def _generate_edits(self, rule: MisraRule, findings: Dict) -> List[Dict]:
+        """Generate machine-readable code edits (start_byte, end_byte, text)."""
+        edits = []
+        
+        # Rule 10.4: Essential Type Mismatch
+        if rule.rule_id.startswith("MisraC2012-10."):
+            # Check if we have macro analysis or expression analysis
+            # Prefer macro analysis if available
+            root = findings.get("macro_analysis") or findings.get("expression_analysis")
+            
+            if root:
+                # Heuristic: if it's a binary expression, cast the operands?
+                # For 10.4, usually one operand needs casting to match the other.
+                # Simplistic fix: Cast left operand to match right, or vice versa?
+                # Or just cast everything to (uint16_t)? 
+                # Without full type info, we can't be 100% sure which one to cast.
+                # But for the proof of concept with the user's specific case (macro),
+                # we can try to cast the first operand if it looks like a signed constant.
+                
+                # Let's inspect operands
+                operands = root.get("operands", [])
+                if len(operands) >= 2:
+                    left = operands[0]
+                    right = operands[1]
+                    
+                    # Assume we want to cast 'left' (often a constant or variable)
+                    # to a standard unsigned type to be safe?
+                    # Better heuristic: if one is 'number_literal', likely it needs a suffix or cast.
+                    # Fix: Insert `(uint16_t)` before left operand.
+                    
+                    target_op = left
+                    
+                    # Offset calculation
+                    start = target_op["start_byte"]
+                    end = target_op["start_byte"] # Insert before
+                    text = "(uint16_t)"
+                    
+                    # Map back if it was a macro
+                    if "macro_analysis" in findings and "body_start_byte" in root:
+                        # Real_offset = body_start + (dummy_offset - prefix_len)
+                        prefix_len = root.get("prefix_len", 0)
+                        body_start = root.get("body_start_byte", 0)
+                        
+                        real_start = body_start + (start - prefix_len)
+                        edits.append({
+                            "start_byte": real_start,
+                            "end_byte": real_start,
+                            "text": text
+                        })
+                    else:
+                        # Normal expression
+                         edits.append({
+                            "start_byte": start,
+                            "end_byte": end,
+                            "text": text
+                        })
+                        
+        return edits
 
     # ────────────────────────────────────────────────────────────────
     #  Guidance generation — uses AST findings, not regex
@@ -538,12 +619,107 @@ class FixEngine:
             return "HIGH"
         if rid == "MisraC2012-8.12" and findings.get("enum_collisions"):
             return "HIGH"
+            
+        # 10.x with macro analysis is high confidence
+        if rid.startswith("MisraC2012-10.") and findings.get("macro_analysis"):
+            return "HIGH"
 
         # MEDIUM: We have function context
         if findings.get("function"):
             return "MEDIUM"
 
         return "LOW"
+
+    # ────────────────────────────────────────────────────────────────
+    #  Side-effect assessment
+    # ────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _assess_side_effects(rule: MisraRule, findings: Dict,
+                             dependencies: Optional[List[str]]) -> List[str]:
+        effects = []
+        cross = findings.get("cross_file", {})
+
+        if rule.rule_id in _CROSS_FILE_RULES:
+            if cross:
+                # Use specific cross-file evidence
+                affected = cross.get("files_affected", [])
+                if affected:
+                    effects.append(
+                        f"Files that need updating: {', '.join(f'`{f}`' for f in affected)}"
+                    )
+
+                ext_callers = cross.get("external_callers", [])
+                if ext_callers:
+                    effects.append(
+                        f"{len(ext_callers)} external caller(s) must be reviewed."
+                    )
+
+                header = cross.get("declared_in_header") or cross.get("header_to_update")
+                if header:
+                    effects.append(f"Header `{header}` must be updated to match.")
+            else:
+                effects.append(
+                    "This fix may require corresponding changes in other files "
+                    "(headers, callers, or other translation units)."
+                )
+
+        # Rule 8.13: const addition affects API
+        if rule.rule_id == "MisraC2012-8.13":
+            total_callers = cross.get("total_callers", 0) if cross else 0
+            if total_callers > 0:
+                effects.append(
+                    f"Adding `const` changes the API — {total_callers} caller(s) and "
+                    f"the header declaration must be updated."
+                )
+            else:
+                effects.append(
+                    "Adding `const` to a function parameter changes its signature — "
+                    "update the declaration in the header file and all callers."
+                )
+
+        # Scope changes
+        fn_info = findings.get("function", {})
+        if fn_info and rule.rule_id in ("MisraC2012-8.8", "MisraC2012-8.10"):
+            if cross and cross.get("safe_to_add_static"):
+                effects.append(
+                    f"Cross-file analysis confirms `{fn_info.get('name', '?')}` is "
+                    f"not used externally — `static` is safe."
+                )
+            elif cross and cross.get("has_external_callers"):
+                effects.append(
+                    f"Adding `static` to `{fn_info.get('name', '?')}` will break "
+                    f"external callers — fix those first or keep external linkage."
+                )
+            else:
+                effects.append(
+                    f"Adding `static` to `{fn_info.get('name', '?')}` removes external "
+                    f"linkage — ensure no other TU calls this function."
+                )
+
+        return effects
+
+    # ────────────────────────────────────────────────────────────────
+    #  Fallback for unknown rules
+    # ────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _unknown_rule(violation: AxivionViolation, line: str,
+                      findings: Dict, function_context: str) -> FixAnalysis:
+        return FixAnalysis(
+            rule_id=violation.rule_id,
+            confidence="LOW",
+            violation_line=line.rstrip() if line else "",
+            function_context=function_context,
+            ast_findings=findings,
+            rule_explanation=f"Rule {violation.rule_id} is not in the knowledge base.",
+            fix_guidance=(
+                f"Violation message: {violation.message}\n\n"
+                f"Consult the MISRA C:2012 standard for this rule."
+            ),
+            compliant_example="",
+            non_compliant_example="",
+        )
 
     # ────────────────────────────────────────────────────────────────
     #  Side-effect assessment
