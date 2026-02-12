@@ -9,6 +9,7 @@ Exposes six tools to GitHub Copilot via the Model Context Protocol:
   4. explain_rule      — full MISRA rule explanation with examples
   5. propose_fix       — AST-informed fix analysis with structural evidence
   6. cross_file_impact — show which files are affected by fixing a symbol
+  7. apply_fix         — automatically apply suggested fixes
 """
 
 from mcp.server.fastmcp import FastMCP
