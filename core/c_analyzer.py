@@ -804,6 +804,62 @@ class CAnalyzer:
 
         return analysis
 
+    def _extract_symbol_name(self, file_path: str, line: int) -> Optional[str]:
+        """Extract the primary symbol name declared/defined at a given line.
+
+        Walks the AST looking for a declaration or function definition at the
+        specified line and returns the identifier name.  Falls back to a simple
+        regex extraction from the source line if the AST walk finds nothing.
+        """
+        source, tree = self._get_tree(file_path)
+        if tree is None:
+            return None
+
+        target_row = line - 1  # tree-sitter uses 0-indexed rows
+
+        # Strategy 1: walk top-level declarations for a match at this line
+        decl_types = {
+            "function_definition", "declaration", "function_declarator",
+        }
+        for node in self._walk_all(tree.root_node):
+            if node.start_point[0] != target_row:
+                continue
+            if node.type == "function_definition":
+                # Find the function_declarator → identifier
+                for child in self._walk_type(node, "function_declarator"):
+                    for gc in child.children:
+                        if gc.type == "identifier":
+                            return self._node_text(gc, source)
+            if node.type in ("declaration", "init_declarator"):
+                for child in node.children:
+                    if child.type == "identifier":
+                        return self._node_text(child, source)
+                    if child.type in ("function_declarator", "init_declarator",
+                                      "array_declarator", "pointer_declarator"):
+                        for gc in self._walk_all(child):
+                            if gc.type == "identifier":
+                                return self._node_text(gc, source)
+
+        # Strategy 2: regex fallback on the source line
+        lines = self._source_lines(file_path)
+        if 0 < line <= len(lines):
+            text = lines[line - 1]
+            # Match common patterns: type name; / type name( / extern type name
+            m = re.search(r'\b(\w+)\s*[(\[;=]', text)
+            if m:
+                # Skip C keywords
+                kw = {"if", "else", "for", "while", "do", "switch", "case",
+                       "return", "sizeof", "typedef", "struct", "union",
+                       "enum", "extern", "static", "inline", "const",
+                       "volatile", "void", "int", "char", "short", "long",
+                       "float", "double", "unsigned", "signed", "_Bool"}
+                candidates = re.findall(r'\b(\w+)\s*[(\[;=]', text)
+                for c in candidates:
+                    if c not in kw:
+                        return c
+
+        return None
+
     def _analyze_macro_definition(self, file_path: str, line: int) -> Optional[Dict]:
         """
         If the line is a #define, try to parse its body as an expression.

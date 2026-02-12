@@ -336,10 +336,12 @@ def cross_file_impact(symbol_name: str) -> str:
 def apply_fix(rule_id: str, file_path: str, line_number: int) -> str:
     """
     Automatically applies the suggested fix for a violation if available.
-    
+
     Currently supports:
-    - Rule 10.x (Essential Type Mismatch): Inserts casts.
-    
+    - Rule 2.x (Unused Code): Deletes dead/unreachable code, inserts (void)param.
+    - Rule 8.x (Declarations): Adds static/const, removes restrict.
+    - Rule 10.x (Essential Types): Inserts casts.
+
     Args:
         rule_id:     The MISRA rule ID.
         file_path:   The file path.
