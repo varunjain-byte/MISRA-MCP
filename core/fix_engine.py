@@ -412,6 +412,13 @@ class FixEngine:
         if rid.startswith("MisraC2012-10."):
             return self._generate_10_x_edits(findings)
 
+        if rid == "MisraC2012-11.9":
+            return self._generate_11_9_edits(findings)
+        if rid == "MisraC2012-14.4":
+            return self._generate_14_4_edits(findings)
+        if rid == "MisraC2012-15.6":
+            return self._generate_15_6_edits(findings, violation)
+
         return ([], "")
 
     # ────────────────────────────────────────────────────────────────
@@ -798,6 +805,56 @@ class FixEngine:
             return ([], "Could not locate 'restrict' keyword on the "
                         "violation line.")
         return (edits, "")
+
+    # ────────────────────────────────────────────────────────────────
+    #  Edit generators — Rules 11-15
+    # ────────────────────────────────────────────────────────────────
+
+    def _generate_11_9_edits(self, findings: Dict) -> List[Dict]:
+        """Rule 11.9: Replace '0' with 'NULL' for pointers."""
+        edits = []
+        for viol in findings.get("null_pointer_violations", []):
+            edits.append({
+                "start_byte": viol["start_byte"],
+                "end_byte": viol["end_byte"],
+                "text": "NULL"
+            })
+        return edits
+
+
+
+    def _generate_14_4_edits(self, findings: Dict) -> List[Dict]:
+        """Rule 14.4: Add explicit boolean check (if(p) -> if(p != 0))."""
+        edits = []
+        for viol in findings.get("non_boolean_conditions", []):
+            # heuristic: if it looks like a pointer or int, add != 0
+            # Ideally we check type. For now, != 0 is safe for numbers/pointers in C
+            # But we must be careful not to double wrap.
+            orig = viol["text"]
+            edits.append({
+                "start_byte": viol["start_byte"],
+                "end_byte": viol["end_byte"],
+                "text": f"{orig} != 0"
+            })
+        return edits
+
+    def _generate_15_6_edits(self, findings: Dict, violation: AxivionViolation) -> List[Dict]:
+        """Rule 15.6: Add braces to body."""
+        edits = []
+        for miss in findings.get("missing_braces", []):
+            # We want to wrap violation["text"] in { }
+            # But we need to preserve indentation.
+            # Simplified approach: "{ " + text + " }"
+            # This is ugly but compliant.
+            
+            # Better: try to indent.
+            # We don't have easy access to indentation here without source analysis.
+            edits.append({
+                "start_byte": miss["start_byte"],
+                "end_byte": miss["end_byte"],
+                "text": f"{{ {miss['text']} }}"
+            })
+        return edits
 
     # ────────────────────────────────────────────────────────────────
     #  Edit generators — Rule 10.x (Essential Type Model)

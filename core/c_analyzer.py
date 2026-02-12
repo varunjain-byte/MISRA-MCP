@@ -791,6 +791,126 @@ class CAnalyzer:
                  if expr_list:
                      analysis["expressions"] = expr_list
 
+        elif rule_id == "MisraC2012-11.9":
+            # Detect usage of '0' as null pointer constant
+            # Logic: Find assignments where LHS is pointer and RHS is literal 0
+            # Weak heuristic without full type propagation, but catch obvious cases
+            # like: int *p = 0; or p = 0;
+            assigns = []
+            source, tree = self._get_tree(file_path)
+            if tree and fn:
+                # Limit to function scope for now
+                fn_node = self._find_function_node(tree.root_node, fn.name, source)
+                if fn_node:
+                    for node in self._walk_all(fn_node):
+                        # check init_declarator: int *p = 0;
+                        if node.type == "init_declarator":
+                            val = self._find_child(node, "number_literal")
+                            if val and self._node_text(val, source) == "0":
+                                # check if decl is pointer
+                                decl = self._find_child(node, "pointer_declarator")
+                                if decl:
+                                    assigns.append({
+                                        "line": val.start_point[0] + 1,
+                                        "start_byte": val.start_byte,
+                                        "end_byte": val.end_byte,
+                                        "context": "init"
+                                    })
+                        # check assignment: p = 0;
+                        elif node.type == "assignment_expression":
+                            rhs = node.children[-1]
+                            if rhs.type == "number_literal" and self._node_text(rhs, source) == "0":
+                                lhs = node.children[0]
+                                # Heuristic: if LHS is known pointer param check
+                                lhs_name = self._node_text(lhs, source)
+                                p_info = next((p for p in fn.params if p.name == lhs_name), None)
+                                if p_info and p_info.is_pointer:
+                                    assigns.append({
+                                        "line": rhs.start_point[0] + 1,
+                                        "start_byte": rhs.start_byte,
+                                        "end_byte": rhs.end_byte,
+                                        "context": "assign"
+                                    })
+            if assigns:
+                analysis["null_pointer_violations"] = assigns
+
+
+
+        elif rule_id == "MisraC2012-14.4":
+            # Controlling expression not essentially boolean
+            # if (p), while (x), ternary ? ...
+            non_bools = []
+            source, tree = self._get_tree(file_path)
+            if tree and fn:
+                fn_node = self._find_function_node(tree.root_node, fn.name, source)
+                if fn_node:
+                    for node in self._walk_all(fn_node):
+                        cond = None
+                        if node.type in ("if_statement", "while_statement", "do_statement"):
+                            cond = self._find_child(node, "parenthesized_expression")
+                        elif node.type == "for_statement":
+                           # for (init; cond; update) - cond is 2nd child usually, but verify
+                           for c in node.children:
+                               # Condition is an expression between semicolons, usually
+                               pass # simplistic for now, focused on if/while
+                        
+                        if cond:
+                            # Strip parens
+                            inner = cond.children[1] if len(cond.children) > 2 else cond
+                            # Check if inner is comparison or logical
+                            # Safe: binary_expression (depends on op), true/false
+                            is_safe = False
+                            if inner.type == "binary_expression":
+                                op = inner.children[1].type
+                                if op in ("==", "!=", "<", ">", "<=", ">=", "&&", "||"):
+                                    is_safe = True
+                            elif inner.type in ("true", "false", "parenthesized_expression"):
+                                is_safe = True # simplify
+                            
+                            if not is_safe:
+                                non_bools.append({
+                                    "line": inner.start_point[0] + 1,
+                                    "start_byte": inner.start_byte,
+                                    "end_byte": inner.end_byte,
+                                    "text": self._node_text(inner, source)
+                                })
+            if non_bools:
+                analysis["non_boolean_conditions"] = non_bools
+
+        elif rule_id == "MisraC2012-15.6":
+            # Body not compound statement
+            missing_braces = []
+            source, tree = self._get_tree(file_path)
+            if tree and fn:
+                fn_node = self._find_function_node(tree.root_node, fn.name, source)
+                if fn_node:
+                    for node in self._walk_all(fn_node):
+                        check_nodes = []
+                        if node.type in ("if_statement", "while_statement", "for_statement"):
+                            # Last child is usually the body, unless it's if-else
+                            if node.type == "if_statement":
+                                # consequence is after condition
+                                # alternative is after 'else'
+                                children = node.children
+                                for i, c in enumerate(children):
+                                    if c.type == "parenthesized_expression" and i+1 < len(children):
+                                        check_nodes.append(children[i+1])
+                                    if c.type == "else" and i+1 < len(children):
+                                        check_nodes.append(children[i+1])
+                            else:
+                                check_nodes.append(node.children[-1])
+                        
+                        for body in check_nodes:
+                            if body.type != "compound_statement" and body.type != "if_statement": # else if is ok structurally if chained
+                                 missing_braces.append({
+                                    "line": body.start_point[0] + 1,
+                                    "start_byte": body.start_byte,
+                                    "end_byte": body.end_byte,
+                                    "text": self._node_text(body, source)
+                                })
+            if missing_braces:
+                analysis["missing_braces"] = missing_braces
+
         elif rule_id.startswith("MisraC2012-8."):
             # Generic linkage analysis for remaining 8.x rules
             sym = self._extract_symbol_name(file_path, line)
