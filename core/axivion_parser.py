@@ -118,6 +118,7 @@ class AxivionParser:
             or item.get("rule_id")
             or item.get("rule")
             or item.get("checkId")
+            or item.get("errorNumber")
             or "UNKNOWN"
         )
 
