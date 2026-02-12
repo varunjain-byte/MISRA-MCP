@@ -367,7 +367,10 @@ def apply_fix(rule_id: str, file_path: str, line_number: int) -> str:
     analysis = fix_engine.propose_fix(target, context, viol_line, None)
     
     if not analysis.edits:
-        return f"No automated fix available for this violation. Guidance:\n{analysis.fix_guidance}"
+        reason = analysis.edit_skip_reason or "No specific reason available."
+        return (f"Auto-fix not available.\n\n"
+                f"**Reason:** {reason}\n\n"
+                f"**Guidance:**\n{analysis.fix_guidance}")
 
     # Apply edits
     try:
