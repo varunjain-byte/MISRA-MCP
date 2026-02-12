@@ -294,8 +294,8 @@ class FixEngine:
         # Determine side effects
         side_effects = self._assess_side_effects(rule, ast_findings, dependencies)
         
-        # NEW: Generate concrete edits
-        edits = self._generate_edits(rule, ast_findings)
+        # Generate concrete edits
+        edits = self._generate_edits(rule, ast_findings, violation)
 
         return FixAnalysis(
             rule_id=rule.rule_id,
@@ -315,93 +315,314 @@ class FixEngine:
     #  Concrete Edit Generation
     # ────────────────────────────────────────────────────────────────
     
-    def _generate_edits(self, rule: MisraRule, findings: Dict) -> List[Dict]:
-        """Generate machine-readable code edits (start_byte, end_byte, text)."""
-        edits = []
-        
-        # Rule 10.4: Essential Type Mismatch
-        if rule.rule_id.startswith("MisraC2012-10.4"):
-            return self._generate_10_4_edits(findings)
+    def _generate_edits(self, rule: MisraRule, findings: Dict,
+                        violation: AxivionViolation) -> List[Dict]:
+        """Generate machine-readable code edits (start_byte, end_byte, text).
 
+        Supports auto-fix for rules 2.x, 8.x, and 10.x where the AST
+        provides enough structural information to produce safe edits.
+        """
+        rid = rule.rule_id
+
+        # ── Rule 2.x — Unused Code ──
+        if rid == "MisraC2012-2.7":
+            return self._generate_2_7_edits(findings, violation)
+        if rid == "MisraC2012-2.5":
+            return self._generate_line_delete_edits(violation)
+        if rid == "MisraC2012-2.6":
+            return self._generate_2_6_edits(violation)
+        if rid in ("MisraC2012-2.1", "MisraC2012-2.2"):
+            return self._generate_line_delete_edits(violation)
+        if rid in ("MisraC2012-2.3", "MisraC2012-2.4"):
+            return self._generate_line_delete_edits(violation)
+
+        # ── Rule 8.x — Declarations & Definitions ──
+        if rid == "MisraC2012-8.10":
+            return self._generate_8_10_edits(findings, violation)
+        if rid == "MisraC2012-8.8":
+            return self._generate_8_8_edits(findings, violation)
+        if rid == "MisraC2012-8.13":
+            return self._generate_8_13_edits(findings, violation)
+        if rid == "MisraC2012-8.14":
+            return self._generate_8_14_edits(violation)
+
+        # ── Rule 10.x — Essential Type Model ──
+        if rid.startswith("MisraC2012-10."):
+            return self._generate_10_x_edits(findings)
+
+        return []
+
+    # ────────────────────────────────────────────────────────────────
+    #  Edit generators — Rule 2.x
+    # ────────────────────────────────────────────────────────────────
+
+    def _get_source_bytes(self, file_path: str) -> Optional[bytes]:
+        """Read source bytes via the analyzer cache or directly."""
+        if self.analyzer:
+            source, _ = self.analyzer._get_tree(file_path)
+            return source
+        return None
+
+    def _line_byte_range(self, source: bytes, line: int):
+        """Return (start_byte, end_byte) for a 1-indexed line, including newline."""
+        lines = source.split(b"\n")
+        if line < 1 or line > len(lines):
+            return None, None
+        offset = sum(len(lines[i]) + 1 for i in range(line - 1))
+        end = offset + len(lines[line - 1])
+        # Include the trailing newline if present
+        if end < len(source) and source[end:end + 1] == b"\n":
+            end += 1
+        return offset, end
+
+    def _generate_line_delete_edits(self, violation: AxivionViolation) -> List[Dict]:
+        """Delete the entire violation line (for 2.1, 2.2, 2.3, 2.4, 2.5)."""
+        source = self._get_source_bytes(violation.file_path)
+        if source is None:
+            return []
+        start, end = self._line_byte_range(source, violation.line_number)
+        if start is None:
+            return []
+        return [{"start_byte": start, "end_byte": end, "text": ""}]
+
+    def _generate_2_6_edits(self, violation: AxivionViolation) -> List[Dict]:
+        """Remove an unused label (e.g. 'cleanup:' → '')."""
+        source = self._get_source_bytes(violation.file_path)
+        if source is None:
+            return []
+        start, end = self._line_byte_range(source, violation.line_number)
+        if start is None:
+            return []
+        line_bytes = source[start:end]
+        line_text = line_bytes.decode("utf-8", errors="replace")
+        # Only delete if the line is just a label (identifier followed by colon)
+        stripped = line_text.strip()
+        if re.match(r'^\w+\s*:\s*$', stripped):
+            return [{"start_byte": start, "end_byte": end, "text": ""}]
+        # If label is on a line with code, just remove the label part
+        m = re.match(r'^(\s*)\w+\s*:\s*', line_text)
+        if m:
+            label_end = start + len(m.group(0).encode("utf-8"))
+            indent = m.group(1)
+            return [{"start_byte": start, "end_byte": label_end,
+                      "text": indent}]
+        return []
+
+    def _generate_2_7_edits(self, findings: Dict,
+                            violation: AxivionViolation) -> List[Dict]:
+        """Insert (void)param; for each unused parameter after function opening brace."""
+        unused = findings.get("unused_params", [])
+        if not unused:
+            return []
+        source = self._get_source_bytes(violation.file_path)
+        if source is None:
+            return []
+        # Find the opening brace of the function body
+        fn_info = findings.get("function", {})
+        start_line = fn_info.get("start_line", violation.line_number)
+        # Scan from start_line to find '{'
+        lines = source.split(b"\n")
+        brace_byte = None
+        offset = sum(len(lines[i]) + 1 for i in range(start_line - 1))
+        for i in range(start_line - 1, min(start_line + 5, len(lines))):
+            line_bytes = lines[i]
+            brace_pos = line_bytes.find(b"{")
+            if brace_pos >= 0:
+                brace_byte = offset + brace_pos + 1  # after the '{'
+                break
+            offset += len(line_bytes) + 1
+        if brace_byte is None:
+            return []
+        # Build the void casts
+        void_stmts = "\n".join(f"    (void){p};" for p in unused) + "\n"
+        return [{"start_byte": brace_byte, "end_byte": brace_byte,
+                 "text": "\n" + void_stmts}]
+
+    # ────────────────────────────────────────────────────────────────
+    #  Edit generators — Rule 8.x
+    # ────────────────────────────────────────────────────────────────
+
+    def _generate_8_10_edits(self, findings: Dict,
+                             violation: AxivionViolation) -> List[Dict]:
+        """Insert 'static ' before 'inline' for Rule 8.10."""
+        if not findings.get("needs_static"):
+            return []
+        source = self._get_source_bytes(violation.file_path)
+        if source is None:
+            return []
+        start, end = self._line_byte_range(source, violation.line_number)
+        if start is None:
+            return []
+        line_bytes = source[start:end]
+        line_text = line_bytes.decode("utf-8", errors="replace")
+        m = re.search(r'\binline\b', line_text)
+        if m:
+            insert_at = start + m.start()
+            return [{"start_byte": insert_at, "end_byte": insert_at,
+                     "text": "static "}]
+        return []
+
+    def _generate_8_8_edits(self, findings: Dict,
+                            violation: AxivionViolation) -> List[Dict]:
+        """Insert 'static ' at start of function definition for Rule 8.8."""
+        fn_info = findings.get("function", {})
+        if not fn_info or fn_info.get("is_static"):
+            return []
+        # Only auto-fix when cross-file analysis confirms safety
+        cross = findings.get("cross_file", {})
+        if cross and not cross.get("safe_to_add_static", False):
+            return []
+        source = self._get_source_bytes(violation.file_path)
+        if source is None:
+            return []
+        target_line = fn_info.get("start_line", violation.line_number)
+        start, end = self._line_byte_range(source, target_line)
+        if start is None:
+            return []
+        line_bytes = source[start:end]
+        line_text = line_bytes.decode("utf-8", errors="replace")
+        # Find start of the declaration (skip leading whitespace)
+        m = re.match(r'^(\s*)', line_text)
+        indent_len = len(m.group(1).encode("utf-8")) if m else 0
+        insert_at = start + indent_len
+        return [{"start_byte": insert_at, "end_byte": insert_at,
+                 "text": "static "}]
+
+    def _generate_8_13_edits(self, findings: Dict,
+                             violation: AxivionViolation) -> List[Dict]:
+        """Add 'const' to pointer parameters that are never written through."""
+        candidates = findings.get("const_candidates", [])
+        safe = [c for c in candidates if c.get("safe_to_add_const")]
+        if not safe:
+            return []
+        source = self._get_source_bytes(violation.file_path)
+        if source is None:
+            return []
+        edits = []
+        source_text = source.decode("utf-8", errors="replace")
+        fn_info = findings.get("function", {})
+        start_line = fn_info.get("start_line", violation.line_number)
+        # Get the function signature region (from start_line, scan for ')')
+        lines = source_text.splitlines(keepends=True)
+        sig_text = ""
+        sig_start_byte = sum(len(l.encode("utf-8")) for l in lines[:start_line - 1])
+        for i in range(start_line - 1, min(start_line + 5, len(lines))):
+            sig_text += lines[i]
+            if ")" in lines[i]:
+                break
+        for c in safe:
+            param_name = c["name"]
+            # Match "type *name" or "type * name" in the signature
+            # Insert const before the type: "const type *name"
+            pattern = rf'([,(]\s*)(\w[\w\s]*?\*\s*{re.escape(param_name)}\b)'
+            m = re.search(pattern, sig_text)
+            if m:
+                insert_offset = sig_start_byte + m.start(2)
+                edits.append({"start_byte": insert_offset,
+                              "end_byte": insert_offset,
+                              "text": "const "})
         return edits
 
-    def _generate_10_4_edits(self, findings: Dict) -> List[Dict]:
-        """Generate casts to resolve essential type mismatches."""
+    def _generate_8_14_edits(self, violation: AxivionViolation) -> List[Dict]:
+        """Remove 'restrict' qualifier for Rule 8.14."""
+        source = self._get_source_bytes(violation.file_path)
+        if source is None:
+            return []
+        start, end = self._line_byte_range(source, violation.line_number)
+        if start is None:
+            return []
+        line_bytes = source[start:end]
+        line_text = line_bytes.decode("utf-8", errors="replace")
         edits = []
-        
+        for m in re.finditer(r'\brestrict\b\s*', line_text):
+            edit_start = start + m.start()
+            edit_end = start + m.end()
+            edits.append({"start_byte": edit_start, "end_byte": edit_end,
+                          "text": ""})
+        return edits
+
+    # ────────────────────────────────────────────────────────────────
+    #  Edit generators — Rule 10.x (Essential Type Model)
+    # ────────────────────────────────────────────────────────────────
+
+    def _generate_10_x_edits(self, findings: Dict) -> List[Dict]:
+        """Generate casts to resolve essential type mismatches (all 10.x rules)."""
+        edits = []
+
         roots = []
         if findings.get("macro_analysis"):
             roots.append(findings["macro_analysis"])
         if findings.get("expressions"):
             roots.extend(findings["expressions"])
-            
+
         if not roots:
             return []
-            
-        # Helper to determine "Essential Type" category
+
         def get_category(t):
-            if t.get("is_float"): return "Floating"
-            if t.get("name") in ("bool", "_Bool"): return "Boolean"
-            if t.get("name") in ("char", "signed char", "unsigned char"): return "Character"
-            if t.get("is_signed"): return "Signed"
+            if t.get("is_float"):
+                return "Floating"
+            if t.get("name") in ("bool", "_Bool"):
+                return "Boolean"
+            if t.get("name") in ("char", "signed char", "unsigned char"):
+                return "Character"
+            if t.get("is_signed"):
+                return "Signed"
             return "Unsigned"
 
         for root in roots:
             operands = root.get("operands", [])
             if len(operands) < 2:
                 continue
-                
+
             left = operands[0]
             right = operands[1]
-            
+
             t_left = left.get("type")
             t_right = right.get("type")
-            
+
             if not t_left or not t_right:
                 continue
 
             cat_left = get_category(t_left)
             cat_right = get_category(t_right)
-            
+
             if cat_left == cat_right:
                 continue
-                
+
             target_op = None
             cast_type = ""
-            
-            # 1. Signed vs Unsigned -> Cast Signed to Unsigned
+
+            # Signed vs Unsigned → cast signed to unsigned
             if cat_left == "Signed" and cat_right == "Unsigned":
                 target_op = left
                 cast_type = f"({t_right['name']})"
             elif cat_left == "Unsigned" and cat_right == "Signed":
                 target_op = right
                 cast_type = f"({t_left['name']})"
-                
-            # 2. Float vs Integer -> Cast Integer to Float
+            # Float vs Integer → cast integer to float
             elif cat_left == "Floating" and cat_right != "Floating":
                 target_op = right
                 cast_type = f"({t_left['name']})"
             elif cat_right == "Floating" and cat_left != "Floating":
                 target_op = left
                 cast_type = f"({t_right['name']})"
-                
-            # 3. Character vs Integer -> Cast Character to Integer
+            # Character vs Integer → cast character to integer
             elif cat_left == "Character":
                 target_op = left
                 cast_type = f"({t_right['name']})"
             elif cat_right == "Character":
                 target_op = right
                 cast_type = f"({t_left['name']})"
-                
+
             if target_op and cast_type:
                 start = target_op["start_byte"]
-                
+
                 # Map back if it was a macro
                 if "macro_analysis" in findings and "body_start_byte" in root:
                     prefix_len = root.get("prefix_len", 0)
                     body_start = root.get("body_start_byte", 0)
                     real_start = body_start + (start - prefix_len)
-                    
+
                     edits.append({
                         "start_byte": real_start,
                         "end_byte": real_start,
@@ -413,7 +634,7 @@ class FixEngine:
                         "end_byte": start,
                         "text": cast_type
                     })
-                
+
         return edits
 
     # ────────────────────────────────────────────────────────────────
@@ -671,97 +892,6 @@ class FixEngine:
             return "MEDIUM"
 
         return "LOW"
-
-    # ────────────────────────────────────────────────────────────────
-    #  Side-effect assessment
-    # ────────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _assess_side_effects(rule: MisraRule, findings: Dict,
-                             dependencies: Optional[List[str]]) -> List[str]:
-        effects = []
-        cross = findings.get("cross_file", {})
-
-        if rule.rule_id in _CROSS_FILE_RULES:
-            if cross:
-                # Use specific cross-file evidence
-                affected = cross.get("files_affected", [])
-                if affected:
-                    effects.append(
-                        f"Files that need updating: {', '.join(f'`{f}`' for f in affected)}"
-                    )
-
-                ext_callers = cross.get("external_callers", [])
-                if ext_callers:
-                    effects.append(
-                        f"{len(ext_callers)} external caller(s) must be reviewed."
-                    )
-
-                header = cross.get("declared_in_header") or cross.get("header_to_update")
-                if header:
-                    effects.append(f"Header `{header}` must be updated to match.")
-            else:
-                effects.append(
-                    "This fix may require corresponding changes in other files "
-                    "(headers, callers, or other translation units)."
-                )
-
-        # Rule 8.13: const addition affects API
-        if rule.rule_id == "MisraC2012-8.13":
-            total_callers = cross.get("total_callers", 0) if cross else 0
-            if total_callers > 0:
-                effects.append(
-                    f"Adding `const` changes the API — {total_callers} caller(s) and "
-                    f"the header declaration must be updated."
-                )
-            else:
-                effects.append(
-                    "Adding `const` to a function parameter changes its signature — "
-                    "update the declaration in the header file and all callers."
-                )
-
-        # Scope changes
-        fn_info = findings.get("function", {})
-        if fn_info and rule.rule_id in ("MisraC2012-8.8", "MisraC2012-8.10"):
-            if cross and cross.get("safe_to_add_static"):
-                effects.append(
-                    f"Cross-file analysis confirms `{fn_info.get('name', '?')}` is "
-                    f"not used externally — `static` is safe."
-                )
-            elif cross and cross.get("has_external_callers"):
-                effects.append(
-                    f"Adding `static` to `{fn_info.get('name', '?')}` will break "
-                    f"external callers — fix those first or keep external linkage."
-                )
-            else:
-                effects.append(
-                    f"Adding `static` to `{fn_info.get('name', '?')}` removes external "
-                    f"linkage — ensure no other TU calls this function."
-                )
-
-        return effects
-
-    # ────────────────────────────────────────────────────────────────
-    #  Fallback for unknown rules
-    # ────────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _unknown_rule(violation: AxivionViolation, line: str,
-                      findings: Dict, function_context: str) -> FixAnalysis:
-        return FixAnalysis(
-            rule_id=violation.rule_id,
-            confidence="LOW",
-            violation_line=line.rstrip() if line else "",
-            function_context=function_context,
-            ast_findings=findings,
-            rule_explanation=f"Rule {violation.rule_id} is not in the knowledge base.",
-            fix_guidance=(
-                f"Violation message: {violation.message}\n\n"
-                f"Consult the MISRA C:2012 standard for this rule."
-            ),
-            compliant_example="",
-            non_compliant_example="",
-        )
 
     # ────────────────────────────────────────────────────────────────
     #  Side-effect assessment
