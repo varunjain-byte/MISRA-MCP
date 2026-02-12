@@ -40,6 +40,7 @@ class FixAnalysis:
     non_compliant_example: str         # from the knowledge base
     side_effects: List[str] = field(default_factory=list)
     edits: List[Dict[str, Any]] = field(default_factory=list)  # [{start, end, text}]
+    edit_skip_reason: str = ""  # explains why auto-fix was not generated
 
     def to_markdown(self) -> str:
         md = f"### Fix Analysis — {self.rule_id}\n"
@@ -294,8 +295,8 @@ class FixEngine:
         # Determine side effects
         side_effects = self._assess_side_effects(rule, ast_findings, dependencies)
         
-        # Generate concrete edits
-        edits = self._generate_edits(rule, ast_findings, violation)
+        # Generate concrete edits (returns edits + reason if skipped)
+        edits, edit_skip_reason = self._generate_edits(rule, ast_findings, violation)
 
         return FixAnalysis(
             rule_id=rule.rule_id,
@@ -308,52 +309,113 @@ class FixEngine:
             compliant_example=rule.compliant,
             non_compliant_example=rule.non_compliant,
             side_effects=side_effects,
-            edits=edits
+            edits=edits,
+            edit_skip_reason=edit_skip_reason,
         )
 
     # ────────────────────────────────────────────────────────────────
     #  Concrete Edit Generation
     # ────────────────────────────────────────────────────────────────
     
+    # ────────────────────────────────────────────────────────────────
+    #  Typed return for edit generation
+    # ────────────────────────────────────────────────────────────────
+
+    # Every _generate_* helper returns (edits, skip_reason).
+    # - edits non-empty  → auto-fix available, skip_reason is ""
+    # - edits empty       → skip_reason explains WHY (never silent)
+
+    _EditResult = tuple  # (List[Dict], str)
+
+    _NO_ANALYZER = ([], "AST analyzer unavailable; cannot produce byte-level edits.")
+
     def _generate_edits(self, rule: MisraRule, findings: Dict,
-                        violation: AxivionViolation) -> List[Dict]:
+                        violation: AxivionViolation) -> "tuple[List[Dict], str]":
         """Generate machine-readable code edits (start_byte, end_byte, text).
 
-        Supports auto-fix for rules 2.x, 8.x, and 10.x where the AST
-        provides enough structural information to produce safe edits.
+        Returns (edits, skip_reason).  When edits is empty, skip_reason is
+        a human-readable explanation of why auto-fix was not generated.
         """
         rid = rule.rule_id
 
-        # ── Rule 2.x — Unused Code ──
-        if rid == "MisraC2012-2.7":
-            return self._generate_2_7_edits(findings, violation)
+        # ── Rule 2.x — Unused Code ──────────────────────────────────
+        if rid == "MisraC2012-2.1":
+            return self._generate_2_1_edits(findings, violation)
+        if rid == "MisraC2012-2.2":
+            return ([], "Rule 2.2 (dead code) requires dataflow analysis to "
+                        "confirm the expression has no side effects. "
+                        "Blind deletion risks removing code with "
+                        "observable behaviour (volatile reads, I/O calls). "
+                        "Manual review required.")
+        if rid in ("MisraC2012-2.3", "MisraC2012-2.4"):
+            return self._generate_2_3_4_edits(findings, violation)
         if rid == "MisraC2012-2.5":
-            return self._generate_line_delete_edits(violation)
+            return self._generate_2_5_edits(violation)
         if rid == "MisraC2012-2.6":
             return self._generate_2_6_edits(violation)
-        if rid in ("MisraC2012-2.1", "MisraC2012-2.2"):
-            return self._generate_line_delete_edits(violation)
-        if rid in ("MisraC2012-2.3", "MisraC2012-2.4"):
-            return self._generate_line_delete_edits(violation)
+        if rid == "MisraC2012-2.7":
+            return self._generate_2_7_edits(findings, violation)
 
-        # ── Rule 8.x — Declarations & Definitions ──
-        if rid == "MisraC2012-8.10":
-            return self._generate_8_10_edits(findings, violation)
+        # ── Rule 8.x — Declarations & Definitions ───────────────────
+        if rid == "MisraC2012-8.1":
+            return ([], "Rule 8.1 (implicit types) requires semantic "
+                        "knowledge of the intended type. The correct type "
+                        "depends on the programmer's intent — no safe default "
+                        "exists.")
+        if rid == "MisraC2012-8.2":
+            return self._generate_8_2_edits(findings, violation)
+        if rid == "MisraC2012-8.3":
+            return ([], "Rule 8.3 (compatible declarations) requires "
+                        "cross-file analysis to identify which declaration is "
+                        "canonical. Changing the wrong one breaks the API.")
+        if rid == "MisraC2012-8.4":
+            return ([], "Rule 8.4 (visible prior declaration) requires "
+                        "adding a prototype in a header file. The choice of "
+                        "which header to modify depends on the project's "
+                        "include structure.")
+        if rid == "MisraC2012-8.5":
+            return ([], "Rule 8.5 (external declaration in one file) "
+                        "requires moving declarations between files. "
+                        "Automated move risks breaking include order or "
+                        "creating circular dependencies.")
+        if rid == "MisraC2012-8.6":
+            return ([], "Rule 8.6 (one external definition) is a linker-"
+                        "level issue requiring analysis of all translation "
+                        "units. Cannot determine which definition to keep "
+                        "from a single file.")
+        if rid == "MisraC2012-8.7":
+            return ([], "Rule 8.7 (no block-scope extern) requires moving "
+                        "the extern declaration to file scope and verifying "
+                        "no other block-scope references exist. Manual "
+                        "restructuring recommended.")
         if rid == "MisraC2012-8.8":
             return self._generate_8_8_edits(findings, violation)
+        if rid == "MisraC2012-8.9":
+            return ([], "Rule 8.9 (define at block scope) requires moving "
+                        "a file-scope variable into a function body. This "
+                        "changes object lifetime and may break other "
+                        "references within the translation unit.")
+        if rid == "MisraC2012-8.10":
+            return self._generate_8_10_edits(findings, violation)
+        if rid == "MisraC2012-8.11":
+            return ([], "Rule 8.11 (explicit array size) requires knowing "
+                        "the intended array size, which depends on the "
+                        "definition in another translation unit.")
+        if rid == "MisraC2012-8.12":
+            return self._generate_8_12_edits(findings, violation)
         if rid == "MisraC2012-8.13":
             return self._generate_8_13_edits(findings, violation)
         if rid == "MisraC2012-8.14":
             return self._generate_8_14_edits(violation)
 
-        # ── Rule 10.x — Essential Type Model ──
+        # ── Rule 10.x — Essential Type Model ────────────────────────
         if rid.startswith("MisraC2012-10."):
             return self._generate_10_x_edits(findings)
 
-        return []
+        return ([], "")
 
     # ────────────────────────────────────────────────────────────────
-    #  Edit generators — Rule 2.x
+    #  Shared helpers
     # ────────────────────────────────────────────────────────────────
 
     def _get_source_bytes(self, file_path: str) -> Optional[bytes]:
@@ -375,134 +437,320 @@ class FixEngine:
             end += 1
         return offset, end
 
-    def _generate_line_delete_edits(self, violation: AxivionViolation) -> List[Dict]:
-        """Delete the entire violation line (for 2.1, 2.2, 2.3, 2.4, 2.5)."""
-        source = self._get_source_bytes(violation.file_path)
-        if source is None:
-            return []
-        start, end = self._line_byte_range(source, violation.line_number)
-        if start is None:
-            return []
-        return [{"start_byte": start, "end_byte": end, "text": ""}]
+    # ────────────────────────────────────────────────────────────────
+    #  Edit generators — Rule 2.x (Unused Code)
+    # ────────────────────────────────────────────────────────────────
 
-    def _generate_2_6_edits(self, violation: AxivionViolation) -> List[Dict]:
-        """Remove an unused label (e.g. 'cleanup:' → '')."""
+    def _generate_2_1_edits(self, findings: Dict,
+                            violation: AxivionViolation
+                            ) -> "tuple[List[Dict], str]":
+        """Rule 2.1: Unreachable code.
+
+        Only auto-fix when the AST confirms the exact reason (e.g. code
+        after an unconditional return/break/continue/goto).  Deleting
+        arbitrary lines without reachability proof is unsafe.
+        """
+        reason = findings.get("unreachable_reason")
+        if not reason:
+            return ([], "Cannot confirm unreachability from AST alone. "
+                        "The code may be reachable through indirect jumps, "
+                        "setjmp/longjmp, or signal handlers. "
+                        "Manual control-flow review needed.")
+        # AST confirmed — safe to remove the single flagged statement
         source = self._get_source_bytes(violation.file_path)
         if source is None:
-            return []
+            return self._NO_ANALYZER
         start, end = self._line_byte_range(source, violation.line_number)
         if start is None:
-            return []
-        line_bytes = source[start:end]
-        line_text = line_bytes.decode("utf-8", errors="replace")
-        # Only delete if the line is just a label (identifier followed by colon)
+            return ([], "Could not resolve violation line in source.")
+        return ([{"start_byte": start, "end_byte": end, "text": ""}], "")
+
+    def _generate_2_3_4_edits(self, findings: Dict,
+                              violation: AxivionViolation
+                              ) -> "tuple[List[Dict], str]":
+        """Rule 2.3/2.4: Unused type/tag declaration.
+
+        Multi-line structs, unions, and enums cannot be safely removed by
+        deleting a single line.  Only remove single-line typedefs.
+        """
+        source = self._get_source_bytes(violation.file_path)
+        if source is None:
+            return self._NO_ANALYZER
+        start, end = self._line_byte_range(source, violation.line_number)
+        if start is None:
+            return ([], "Could not resolve violation line in source.")
+        line_text = source[start:end].decode("utf-8", errors="replace").strip()
+        # Single-line typedef: "typedef int mytype;" — safe to remove
+        if line_text.startswith("typedef") and line_text.endswith(";"):
+            return ([{"start_byte": start, "end_byte": end, "text": ""}], "")
+        # Multi-line struct/union/enum — refuse
+        return ([], f"Declaration may span multiple lines "
+                    f"(detected: `{line_text[:60]}…`). "
+                    f"Removing only the flagged line would leave a syntax "
+                    f"error. Identify the full declaration boundary and "
+                    f"remove the entire block.")
+
+    def _generate_2_5_edits(self, violation: AxivionViolation
+                            ) -> "tuple[List[Dict], str]":
+        """Rule 2.5: Unused macro (#define).
+
+        Handles backslash-continued multi-line macros by scanning
+        forward until a line does NOT end with '\\'.
+        """
+        source = self._get_source_bytes(violation.file_path)
+        if source is None:
+            return self._NO_ANALYZER
+        raw_lines = source.split(b"\n")
+        ln = violation.line_number
+        if ln < 1 or ln > len(raw_lines):
+            return ([], "Could not resolve violation line in source.")
+        # Verify it actually IS a #define
+        first_line = raw_lines[ln - 1].decode("utf-8", errors="replace").strip()
+        if not first_line.startswith("#"):
+            return ([], f"Line {ln} is not a preprocessor directive "
+                        f"(`{first_line[:40]}…`). Cannot safely delete.")
+        # Scan for continuation lines (trailing backslash)
+        end_ln = ln
+        while end_ln <= len(raw_lines):
+            text = raw_lines[end_ln - 1].decode("utf-8", errors="replace").rstrip()
+            if not text.endswith("\\"):
+                break
+            end_ln += 1
+        start, _ = self._line_byte_range(source, ln)
+        _, end = self._line_byte_range(source, end_ln)
+        if start is None or end is None:
+            return ([], "Could not compute byte range for macro.")
+        return ([{"start_byte": start, "end_byte": end, "text": ""}], "")
+
+    def _generate_2_6_edits(self, violation: AxivionViolation
+                            ) -> "tuple[List[Dict], str]":
+        """Rule 2.6: Unused label.
+
+        Handles two forms:
+        - Standalone label line ('cleanup:')  → delete entire line
+        - Label prefixing a statement ('retry: x++;')  → strip label only
+        """
+        source = self._get_source_bytes(violation.file_path)
+        if source is None:
+            return self._NO_ANALYZER
+        start, end = self._line_byte_range(source, violation.line_number)
+        if start is None:
+            return ([], "Could not resolve violation line in source.")
+        line_text = source[start:end].decode("utf-8", errors="replace")
         stripped = line_text.strip()
+        # Standalone label line
         if re.match(r'^\w+\s*:\s*$', stripped):
-            return [{"start_byte": start, "end_byte": end, "text": ""}]
-        # If label is on a line with code, just remove the label part
+            return ([{"start_byte": start, "end_byte": end, "text": ""}], "")
+        # Label prefixing code — remove just the label portion
         m = re.match(r'^(\s*)\w+\s*:\s*', line_text)
         if m:
             label_end = start + len(m.group(0).encode("utf-8"))
             indent = m.group(1)
-            return [{"start_byte": start, "end_byte": label_end,
-                      "text": indent}]
-        return []
+            return ([{"start_byte": start, "end_byte": label_end,
+                       "text": indent}], "")
+        return ([], f"Could not isolate the label on line {violation.line_number}. "
+                    f"The label may be embedded in a complex expression.")
 
     def _generate_2_7_edits(self, findings: Dict,
-                            violation: AxivionViolation) -> List[Dict]:
-        """Insert (void)param; for each unused parameter after function opening brace."""
+                            violation: AxivionViolation
+                            ) -> "tuple[List[Dict], str]":
+        """Rule 2.7: Unused parameter — insert (void)param; statements.
+
+        Only generates edits when the AST confirms specific parameter
+        names are unused throughout the function body.
+        """
         unused = findings.get("unused_params", [])
         if not unused:
-            return []
+            return ([], "AST did not identify any confirmed-unused "
+                        "parameters. The parameter may be used in a macro "
+                        "expansion or via a pointer alias.")
         source = self._get_source_bytes(violation.file_path)
         if source is None:
-            return []
-        # Find the opening brace of the function body
+            return self._NO_ANALYZER
+        # Locate the opening brace of the function body
         fn_info = findings.get("function", {})
         start_line = fn_info.get("start_line", violation.line_number)
-        # Scan from start_line to find '{'
-        lines = source.split(b"\n")
+        raw_lines = source.split(b"\n")
         brace_byte = None
-        offset = sum(len(lines[i]) + 1 for i in range(start_line - 1))
-        for i in range(start_line - 1, min(start_line + 5, len(lines))):
-            line_bytes = lines[i]
-            brace_pos = line_bytes.find(b"{")
-            if brace_pos >= 0:
-                brace_byte = offset + brace_pos + 1  # after the '{'
+        offset = sum(len(raw_lines[i]) + 1 for i in range(start_line - 1))
+        for i in range(start_line - 1, min(start_line + 10, len(raw_lines))):
+            pos = raw_lines[i].find(b"{")
+            if pos >= 0:
+                brace_byte = offset + pos + 1  # byte after '{'
                 break
-            offset += len(line_bytes) + 1
+            offset += len(raw_lines[i]) + 1
         if brace_byte is None:
-            return []
-        # Build the void casts
-        void_stmts = "\n".join(f"    (void){p};" for p in unused) + "\n"
-        return [{"start_byte": brace_byte, "end_byte": brace_byte,
-                 "text": "\n" + void_stmts}]
+            return ([], "Could not locate the function body opening brace. "
+                        "The function signature may span too many lines.")
+        # Batch all (void) casts into a single insertion
+        void_stmts = "\n".join(f"    (void){p};" for p in unused)
+        return ([{"start_byte": brace_byte, "end_byte": brace_byte,
+                  "text": "\n" + void_stmts + "\n"}], "")
 
     # ────────────────────────────────────────────────────────────────
-    #  Edit generators — Rule 8.x
+    #  Edit generators — Rule 8.x (Declarations & Definitions)
     # ────────────────────────────────────────────────────────────────
 
-    def _generate_8_10_edits(self, findings: Dict,
-                             violation: AxivionViolation) -> List[Dict]:
-        """Insert 'static ' before 'inline' for Rule 8.10."""
-        if not findings.get("needs_static"):
-            return []
+    def _generate_8_2_edits(self, findings: Dict,
+                            violation: AxivionViolation
+                            ) -> "tuple[List[Dict], str]":
+        """Rule 8.2: Function types shall be in prototype form.
+
+        Auto-fixes the common case: `int f()` → `int f(void)`.
+        Only safe when the empty parens literally appear on the line.
+        """
         source = self._get_source_bytes(violation.file_path)
         if source is None:
-            return []
+            return self._NO_ANALYZER
         start, end = self._line_byte_range(source, violation.line_number)
         if start is None:
-            return []
-        line_bytes = source[start:end]
-        line_text = line_bytes.decode("utf-8", errors="replace")
-        m = re.search(r'\binline\b', line_text)
+            return ([], "Could not resolve violation line in source.")
+        line_text = source[start:end].decode("utf-8", errors="replace")
+        # Match empty parameter list: "name()" or "name( )"
+        m = re.search(r'(\w+)\s*\(\s*\)', line_text)
         if m:
-            insert_at = start + m.start()
-            return [{"start_byte": insert_at, "end_byte": insert_at,
-                     "text": "static "}]
-        return []
+            paren_start = start + line_text.index("(") + 1
+            paren_end = start + line_text.index(")")
+            # Handle whitespace inside parens
+            inner = source[paren_start:paren_end]
+            return ([{"start_byte": paren_start, "end_byte": paren_end,
+                       "text": "void"}], "")
+        return ([], "Could not find empty parameter list `()` on the "
+                    "violation line. The function may already have "
+                    "parameters, or the signature may span multiple lines.")
 
     def _generate_8_8_edits(self, findings: Dict,
-                            violation: AxivionViolation) -> List[Dict]:
-        """Insert 'static ' at start of function definition for Rule 8.8."""
+                            violation: AxivionViolation
+                            ) -> "tuple[List[Dict], str]":
+        """Rule 8.8: Missing 'static' for internal linkage.
+
+        Only generates the edit when cross-file analysis explicitly
+        confirms the function has no external callers and no header
+        declaration.  Without that proof, adding 'static' could break
+        other translation units.
+        """
         fn_info = findings.get("function", {})
-        if not fn_info or fn_info.get("is_static"):
-            return []
-        # Only auto-fix when cross-file analysis confirms safety
+        if not fn_info:
+            return ([], "No function context available at the violation "
+                        "line. Cannot determine linkage.")
+        if fn_info.get("is_static"):
+            return ([], "Function is already declared static.")
         cross = findings.get("cross_file", {})
-        if cross and not cross.get("safe_to_add_static", False):
-            return []
+        if not cross:
+            return ([], f"No cross-file analysis available for "
+                        f"`{fn_info.get('name', '?')}`. Adding `static` "
+                        f"without confirming zero external references "
+                        f"would silently break any other TU that calls "
+                        f"this function.")
+        if not cross.get("safe_to_add_static", False):
+            callers = cross.get("external_callers", [])
+            header = cross.get("declared_in_header", "")
+            parts = []
+            if callers:
+                names = [f"`{c.get('file', '?')}:{c.get('line', '?')}`"
+                         for c in callers[:3]]
+                parts.append(f"external callers: {', '.join(names)}")
+            if header:
+                parts.append(f"declared in header `{header}`")
+            detail = "; ".join(parts) if parts else "has external references"
+            return ([], f"Cannot add `static` — {detail}. "
+                        f"Fix the callers first or keep external linkage.")
+        # Safe — insert 'static '
         source = self._get_source_bytes(violation.file_path)
         if source is None:
-            return []
+            return self._NO_ANALYZER
         target_line = fn_info.get("start_line", violation.line_number)
         start, end = self._line_byte_range(source, target_line)
         if start is None:
-            return []
-        line_bytes = source[start:end]
-        line_text = line_bytes.decode("utf-8", errors="replace")
-        # Find start of the declaration (skip leading whitespace)
+            return ([], "Could not resolve function definition line.")
+        line_text = source[start:end].decode("utf-8", errors="replace")
         m = re.match(r'^(\s*)', line_text)
         indent_len = len(m.group(1).encode("utf-8")) if m else 0
         insert_at = start + indent_len
-        return [{"start_byte": insert_at, "end_byte": insert_at,
-                 "text": "static "}]
+        return ([{"start_byte": insert_at, "end_byte": insert_at,
+                  "text": "static "}], "")
 
-    def _generate_8_13_edits(self, findings: Dict,
-                             violation: AxivionViolation) -> List[Dict]:
-        """Add 'const' to pointer parameters that are never written through."""
-        candidates = findings.get("const_candidates", [])
-        safe = [c for c in candidates if c.get("safe_to_add_const")]
-        if not safe:
-            return []
+    def _generate_8_10_edits(self, findings: Dict,
+                             violation: AxivionViolation
+                             ) -> "tuple[List[Dict], str]":
+        """Rule 8.10: Insert 'static' before 'inline'.
+
+        An inline function without static in C has external linkage.
+        If no other TU provides an external definition, this is UB
+        (C11 §6.7.4¶7).  The fix is always to add 'static'.
+        """
+        if not findings.get("needs_static"):
+            fn = findings.get("function", {})
+            if fn and fn.get("is_static"):
+                return ([], "Function already has 'static'.")
+            if fn and not fn.get("is_inline"):
+                return ([], "Function is not 'inline' — rule 8.10 may "
+                            "not apply here.")
+            return ([], "AST did not confirm this function needs 'static'. "
+                        "Verify the function is both 'inline' and missing "
+                        "'static'.")
         source = self._get_source_bytes(violation.file_path)
         if source is None:
-            return []
-        edits = []
+            return self._NO_ANALYZER
+        start, end = self._line_byte_range(source, violation.line_number)
+        if start is None:
+            return ([], "Could not resolve violation line in source.")
+        line_text = source[start:end].decode("utf-8", errors="replace")
+        m = re.search(r'\binline\b', line_text)
+        if m:
+            insert_at = start + m.start()
+            return ([{"start_byte": insert_at, "end_byte": insert_at,
+                      "text": "static "}], "")
+        return ([], "Could not locate 'inline' keyword on the violation "
+                    "line. The keyword may be on a different line of a "
+                    "multi-line declaration.")
+
+    def _generate_8_12_edits(self, findings: Dict,
+                             violation: AxivionViolation
+                             ) -> "tuple[List[Dict], str]":
+        """Rule 8.12: Implicit enum values shall be unique.
+
+        The correct fix depends on the intended values, which only
+        the developer knows.  We report the collisions but do not
+        guess values.
+        """
+        collisions = findings.get("enum_collisions", {})
+        if collisions:
+            parts = [f"{val}: {', '.join(names)}"
+                     for val, names in collisions.items()]
+            return ([], f"Enum value collisions detected "
+                        f"({'; '.join(parts)}). Assigning explicit values "
+                        f"requires knowing the intended semantics — "
+                        f"auto-fix would be guessing.")
+        return ([], "No enum collisions detected by AST analysis.")
+
+    def _generate_8_13_edits(self, findings: Dict,
+                             violation: AxivionViolation
+                             ) -> "tuple[List[Dict], str]":
+        """Rule 8.13: Pointer parameters should point to const.
+
+        Only modifies parameters that the AST confirms are never
+        written through in the function body.  For externally-visible
+        functions, warns about API impact.
+        """
+        candidates = findings.get("const_candidates", [])
+        if not candidates:
+            return ([], "AST did not identify pointer parameters to "
+                        "analyze for const-qualification.")
+        safe = [c for c in candidates if c.get("safe_to_add_const")]
+        unsafe = [c for c in candidates if not c.get("safe_to_add_const")]
+        if not safe:
+            names = [f"`{c['name']}`(written L{c.get('write_lines', ['?'])})"
+                     for c in unsafe]
+            return ([], f"All pointer parameters are written through: "
+                        f"{', '.join(names)}. Cannot add const.")
+        source = self._get_source_bytes(violation.file_path)
+        if source is None:
+            return self._NO_ANALYZER
         source_text = source.decode("utf-8", errors="replace")
         fn_info = findings.get("function", {})
         start_line = fn_info.get("start_line", violation.line_number)
-        # Get the function signature region (from start_line, scan for ')')
+        # Build signature region
         lines = source_text.splitlines(keepends=True)
         sig_text = ""
         sig_start_byte = sum(len(l.encode("utf-8")) for l in lines[:start_line - 1])
@@ -510,10 +758,9 @@ class FixEngine:
             sig_text += lines[i]
             if ")" in lines[i]:
                 break
+        edits = []
         for c in safe:
             param_name = c["name"]
-            # Match "type *name" or "type * name" in the signature
-            # Insert const before the type: "const type *name"
             pattern = rf'([,(]\s*)(\w[\w\s]*?\*\s*{re.escape(param_name)}\b)'
             m = re.search(pattern, sig_text)
             if m:
@@ -521,34 +768,49 @@ class FixEngine:
                 edits.append({"start_byte": insert_offset,
                               "end_byte": insert_offset,
                               "text": "const "})
-        return edits
+        if not edits:
+            return ([], "Could not locate the parameter declarations in "
+                        "the function signature. The signature may use "
+                        "complex types or span many lines.")
+        return (edits, "")
 
-    def _generate_8_14_edits(self, violation: AxivionViolation) -> List[Dict]:
-        """Remove 'restrict' qualifier for Rule 8.14."""
+    def _generate_8_14_edits(self, violation: AxivionViolation
+                             ) -> "tuple[List[Dict], str]":
+        """Rule 8.14: Remove 'restrict' qualifier.
+
+        The restrict keyword is a C99 optimisation hint; removing it
+        is always safe from a correctness standpoint.
+        """
         source = self._get_source_bytes(violation.file_path)
         if source is None:
-            return []
+            return self._NO_ANALYZER
         start, end = self._line_byte_range(source, violation.line_number)
         if start is None:
-            return []
-        line_bytes = source[start:end]
-        line_text = line_bytes.decode("utf-8", errors="replace")
+            return ([], "Could not resolve violation line in source.")
+        line_text = source[start:end].decode("utf-8", errors="replace")
         edits = []
         for m in re.finditer(r'\brestrict\b\s*', line_text):
             edit_start = start + m.start()
             edit_end = start + m.end()
             edits.append({"start_byte": edit_start, "end_byte": edit_end,
                           "text": ""})
-        return edits
+        if not edits:
+            return ([], "Could not locate 'restrict' keyword on the "
+                        "violation line.")
+        return (edits, "")
 
     # ────────────────────────────────────────────────────────────────
     #  Edit generators — Rule 10.x (Essential Type Model)
     # ────────────────────────────────────────────────────────────────
 
-    def _generate_10_x_edits(self, findings: Dict) -> List[Dict]:
-        """Generate casts to resolve essential type mismatches (all 10.x rules)."""
-        edits = []
+    def _generate_10_x_edits(self, findings: Dict
+                             ) -> "tuple[List[Dict], str]":
+        """Generate casts to resolve essential type mismatches (all 10.x).
 
+        Inserts explicit casts to make implicit type conversions visible.
+        The cast target follows MISRA's essential type hierarchy:
+          Boolean < Character < Signed/Unsigned < Floating
+        """
         roots = []
         if findings.get("macro_analysis"):
             roots.append(findings["macro_analysis"])
@@ -556,7 +818,10 @@ class FixEngine:
             roots.extend(findings["expressions"])
 
         if not roots:
-            return []
+            return ([], "AST did not identify expression operands with "
+                        "type information. The violation may be in a macro "
+                        "expansion or complex expression that the analyzer "
+                        "cannot decompose.")
 
         def get_category(t):
             if t.get("is_float"):
@@ -569,23 +834,19 @@ class FixEngine:
                 return "Signed"
             return "Unsigned"
 
+        edits = []
         for root in roots:
             operands = root.get("operands", [])
             if len(operands) < 2:
                 continue
 
-            left = operands[0]
-            right = operands[1]
-
-            t_left = left.get("type")
-            t_right = right.get("type")
-
+            left, right = operands[0], operands[1]
+            t_left, t_right = left.get("type"), right.get("type")
             if not t_left or not t_right:
                 continue
 
             cat_left = get_category(t_left)
             cat_right = get_category(t_right)
-
             if cat_left == cat_right:
                 continue
 
@@ -594,48 +855,40 @@ class FixEngine:
 
             # Signed vs Unsigned → cast signed to unsigned
             if cat_left == "Signed" and cat_right == "Unsigned":
-                target_op = left
-                cast_type = f"({t_right['name']})"
+                target_op, cast_type = left, f"({t_right['name']})"
             elif cat_left == "Unsigned" and cat_right == "Signed":
-                target_op = right
-                cast_type = f"({t_left['name']})"
+                target_op, cast_type = right, f"({t_left['name']})"
             # Float vs Integer → cast integer to float
             elif cat_left == "Floating" and cat_right != "Floating":
-                target_op = right
-                cast_type = f"({t_left['name']})"
+                target_op, cast_type = right, f"({t_left['name']})"
             elif cat_right == "Floating" and cat_left != "Floating":
-                target_op = left
-                cast_type = f"({t_right['name']})"
+                target_op, cast_type = left, f"({t_right['name']})"
             # Character vs Integer → cast character to integer
             elif cat_left == "Character":
-                target_op = left
-                cast_type = f"({t_right['name']})"
+                target_op, cast_type = left, f"({t_right['name']})"
             elif cat_right == "Character":
-                target_op = right
-                cast_type = f"({t_left['name']})"
+                target_op, cast_type = right, f"({t_left['name']})"
 
             if target_op and cast_type:
-                start = target_op["start_byte"]
+                byte_start = target_op["start_byte"]
 
-                # Map back if it was a macro
+                # Map back through macro if needed
                 if "macro_analysis" in findings and "body_start_byte" in root:
                     prefix_len = root.get("prefix_len", 0)
                     body_start = root.get("body_start_byte", 0)
-                    real_start = body_start + (start - prefix_len)
+                    byte_start = body_start + (byte_start - prefix_len)
 
-                    edits.append({
-                        "start_byte": real_start,
-                        "end_byte": real_start,
-                        "text": cast_type
-                    })
-                else:
-                    edits.append({
-                        "start_byte": start,
-                        "end_byte": start,
-                        "text": cast_type
-                    })
+                edits.append({
+                    "start_byte": byte_start,
+                    "end_byte": byte_start,
+                    "text": cast_type,
+                })
 
-        return edits
+        if not edits:
+            return ([], "Operand types are in the same essential-type "
+                        "category; no cast needed, or the type combination "
+                        "is not yet handled by the auto-fixer.")
+        return (edits, "")
 
     # ────────────────────────────────────────────────────────────────
     #  Guidance generation — uses AST findings, not regex
