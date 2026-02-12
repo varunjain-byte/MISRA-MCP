@@ -399,4 +399,14 @@ def apply_fix(rule_id: str, file_path: str, line_number: int) -> str:
 
 
 if __name__ == "__main__":
+    # Debug: Print loaded tools to stderr (visible in MCP logs)
+    try:
+        if hasattr(mcp, "_tool_manager") and hasattr(mcp._tool_manager, "_tools"):
+            tools = mcp._tool_manager._tools.keys()
+            print(f"DEBUG: Axivion Agent starting with {len(tools)} tools: {list(tools)}", file=sys.stderr)
+        else:
+             print("DEBUG: Axivion Agent starting (cannot inspect tools)", file=sys.stderr)
+    except Exception as e:
+        print(f"DEBUG: Error inspecting tools: {e}", file=sys.stderr)
+        
     mcp.run()
