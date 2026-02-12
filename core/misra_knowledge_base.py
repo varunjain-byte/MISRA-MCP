@@ -11,6 +11,9 @@ Fix generation is handled by the AST-aware fix engine (fix_engine.py + c_analyze
 from typing import Dict, Optional, List
 from dataclasses import dataclass, field
 
+# Extended rules are imported at the end to avoid circular dependency
+
+
 
 @dataclass
 class MisraRule:
@@ -25,13 +28,22 @@ class MisraRule:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Knowledge Base — all 29 rules
+#  Knowledge Base — all rules
 # ═══════════════════════════════════════════════════════════════════════
 
 _RULES: Dict[str, MisraRule] = {}
 
 def _add(rule: MisraRule):
     _RULES[rule.rule_id] = rule
+
+# Inject extended rules
+# Import here to avoid circular dependency (MisraRule is defined above)
+try:
+    from .misra_rules_extended import EXTENDED_RULES
+    for r in EXTENDED_RULES:
+        _add(r)
+except ImportError:
+    pass
 
 # ───────────────────────────────────────────────────────────────────────
 #  Rule 2.x — Unused Code

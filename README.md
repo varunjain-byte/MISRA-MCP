@@ -183,6 +183,16 @@ cross_file_impact(symbol_name="compute_sum")
   **Files affected**: 4
 ```
 
+### 7. `coverage_report`
+Generates a summary of all active MISRA rules.
+
+```
+coverage_report()
+→ # MISRA C:2012 Coverage Report
+  **Total Rules Supported**: 160
+  ...
+```
+
 ## Supported Axivion JSON Formats
 
 The parser auto-detects these structures:
@@ -206,14 +216,31 @@ Each issue can use various key names — the parser normalises them:
 
 ## MISRA Rules Covered
 
-### Rule 2.x — Unused Code (7 rules)
-2.1 Unreachable code · 2.2 Dead code · 2.3 Unused type · 2.4 Unused tag · 2.5 Unused macro · 2.6 Unused label · 2.7 Unused parameter
+The agent now supports **160+ rules** across all major MISRA C:2012 sections.
 
-### Rule 8.x — Declarations & Definitions (14 rules)
-8.1 Explicit types · 8.2 Prototype form · 8.3 Consistent declarations · 8.4 Compatible declaration · 8.5 Single extern · 8.6 One external definition · 8.7 No block-scope extern · 8.8 Static for internal · 8.9 Block scope if single use · 8.10 Static inline · 8.11 Extern array size · 8.12 Unique enum values · 8.13 Pointer to const · 8.14 No restrict
+| Section | Topic | Supported Rules |
+|---------|-------|-----------------|
+| **2.x** | Unused Code | 2.1 – 2.7 (All) |
+| **5.x** | Identifiers | 5.1 – 5.9 |
+| **6.x** | Types | 6.1 – 6.2 |
+| **7.x** | Literals | 7.1 – 7.4 |
+| **8.x** | Declarations | 8.1 – 8.14 (All) |
+| **9.x** | Initialization | 9.1 – 9.5 |
+| **10.x**| Essential Types | 10.1 – 10.8 (All) |
+| **11.x**| Pointer Casting | 11.1 – 11.9 |
+| **12.x**| Expressions | 12.1 – 12.4 |
+| **13.x**| Side Effects | 13.1 – 13.6 |
+| **14.x**| Control Flow | 14.1 – 14.4 |
+| **15.x**| Control Flow | 15.1 – 15.7 |
+| **16.x**| Switch | 16.1 – 16.7 |
+| **17.x**| Functions | 17.1 – 17.8 |
+| **18.x**| Pointers | 18.1 – 18.8 |
+| **19.x**| Overlapping | 19.1, 19.2 |
+| **20.x**| Preprocessor | 20.1 – 20.14 |
+| **21.x**| Stdlib | 21.1 – 21.21 |
+| **22.x**| Resources | 22.1 – 22.10 |
 
-### Rule 10.x — Essential Type Model (8 rules)
-10.1 Appropriate operand type · 10.2 Character arithmetic · 10.3 Narrowing assignment · 10.4 Same type category · 10.5 Appropriate cast type · 10.6 Composite to wider · 10.7 Composite operand width · 10.8 Composite cast category
+Run the `coverage_report` tool to see the full list of enabled rules.
 
 ## Known Limitations
 

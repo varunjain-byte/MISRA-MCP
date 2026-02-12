@@ -10,6 +10,7 @@ Exposes six tools to GitHub Copilot via the Model Context Protocol:
   5. propose_fix       — AST-informed fix analysis with structural evidence
   6. cross_file_impact — show which files are affected by fixing a symbol
   7. apply_fix         — automatically apply suggested fixes
+  8. coverage_report   — list all supported rules and statistics
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -398,6 +399,55 @@ def apply_fix(rule_id: str, file_path: str, line_number: int) -> str:
         
     except Exception as e:
         return f"Error applying fix: {e}"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Tool 8 — Coverage Report
+# ═══════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def coverage_report() -> str:
+    """
+    Returns a markdown report of all supported MISRA C:2012 rules,
+    grouped by section (e.g., 2.x, 8.x, 10.x), with coverage statistics.
+    """
+    from core.misra_knowledge_base import _RULES
+
+    # Group rules by section
+    sections = {}
+    total_rules = len(_RULES)
+    
+    for rule_id in _RULES:
+        # Extract section prefix (e.g. "MisraC2012-8.3" -> "8.x")
+        try:
+            # ID format: 'MisraC2012-X.Y'
+            # Split by '-' then take last part 'X.Y', then split by '.'
+            number_part = rule_id.split('-')[-1]
+            section_num = number_part.split('.')[0]
+            section_key = f"{section_num}.x"
+        except Exception:
+            section_key = "Other"
+
+        if section_key not in sections:
+            sections[section_key] = []
+        sections[section_key].append(rule_id)
+
+    # Sort sections numerically if possible
+    sorted_keys = sorted(sections.keys(), key=lambda s: float(s.replace('.x', '')) if s[0].isdigit() else 999)
+
+    report = f"# MISRA C:2012 Coverage Report\n\n"
+    report += f"**Total Rules Supported**: {total_rules}\n\n"
+    report += "| Section | Count | Rules |\n"
+    report += "|---------|-------|-------|\n"
+
+    for section in sorted_keys:
+        rules = sorted(sections[section], key=lambda r: [int(n) for n in r.split('-')[-1].split('.')])
+        count = len(rules)
+        # listing specific rules might be verbose, so we list ranges or first few
+        rule_list = ", ".join(rules)
+        report += f"| **{section}** | {count} | {rule_list} |\n"
+
+    return report
 
 
 if __name__ == "__main__":
