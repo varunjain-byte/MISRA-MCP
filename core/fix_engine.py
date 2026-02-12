@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from core.misra_knowledge_base import get_rule, MisraRule
 from core.axivion_parser import AxivionViolation
 from core.c_analyzer import CAnalyzer
+from core.context_provider import ContextProvider
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -231,8 +232,9 @@ _CROSS_FILE_RULES = {
 class FixEngine:
     """Generates rich, AST-informed fix analyses for MISRA violations."""
 
-    def __init__(self, analyzer: Optional[CAnalyzer] = None):
+    def __init__(self, analyzer: Optional[CAnalyzer] = None, context_provider: Optional[ContextProvider] = None):
         self.analyzer = analyzer
+        self.context_provider = context_provider
 
     def propose_fix(
         self,
