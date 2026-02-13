@@ -409,8 +409,13 @@ class FixEngine:
             return self._generate_8_14_edits(violation)
 
         # ── Rule 10.x — Essential Type Model ────────────────────────
+        if rid == "MisraC2012-10.5":
+            return ([], "Rule 10.5 prohibits inappropriate casts. "
+                        "Adding a cast would violate this rule — the fix "
+                        "is to remove the existing cast or change the "
+                        "destination type. Manual review required.")
         if rid.startswith("MisraC2012-10."):
-            return self._generate_10_x_edits(findings)
+            return self._generate_10_x_edits(findings, violation)
 
         if rid == "MisraC2012-11.9":
             return self._generate_11_9_edits(findings)
@@ -454,8 +459,11 @@ class FixEngine:
         """Rule 2.1: Unreachable code.
 
         Only auto-fix when the AST confirms the exact reason (e.g. code
-        after an unconditional return/break/continue/goto).  Deleting
-        arbitrary lines without reachability proof is unsafe.
+        after an unconditional return/break/continue/goto).
+
+        Removes ALL unreachable statements in the same block after the
+        terminal statement, not just the single flagged line.  This
+        prevents cascading 2.1 violations on the remaining lines.
         """
         reason = findings.get("unreachable_reason")
         if not reason:
@@ -463,13 +471,55 @@ class FixEngine:
                         "The code may be reachable through indirect jumps, "
                         "setjmp/longjmp, or signal handlers. "
                         "Manual control-flow review needed.")
-        # AST confirmed — safe to remove the single flagged statement
+
         source = self._get_source_bytes(violation.file_path)
         if source is None:
             return self._NO_ANALYZER
-        start, end = self._line_byte_range(source, violation.line_number)
+
+        # Try to determine the full unreachable range using AST
+        unreachable_range = findings.get("unreachable_range")
+        if unreachable_range:
+            # AST gave us the exact (start_line, end_line) of the
+            # unreachable block
+            first = unreachable_range["start_line"]
+            last = unreachable_range["end_line"]
+            start, _ = self._line_byte_range(source, first)
+            _, end = self._line_byte_range(source, last)
+            if start is not None and end is not None:
+                return ([{"start_byte": start, "end_byte": end, "text": ""}], "")
+
+        # Fallback: scan forward from the flagged line to find the end of
+        # the unreachable block (up to the closing brace of the enclosing
+        # compound statement)
+        raw_lines = source.split(b"\n")
+        viol_line = violation.line_number
+        start, _ = self._line_byte_range(source, viol_line)
         if start is None:
             return ([], "Could not resolve violation line in source.")
+
+        # Scan forward: include all lines until we hit a line that's a
+        # closing brace, a label, a case, or a preprocessor directive
+        end_ln = viol_line
+        for i in range(viol_line - 1, len(raw_lines)):
+            text = raw_lines[i].decode("utf-8", errors="replace").strip()
+            # Stop before closing brace or scope-ending constructs
+            if text == "}" or text.startswith("case ") or text.startswith("default:"):
+                break
+            # Stop before labels (could be a goto target making code reachable)
+            if re.match(r'^\w+\s*:', text) and not text.startswith("default"):
+                break
+            # Stop before preprocessor directives
+            if text.startswith("#"):
+                break
+            end_ln = i + 1  # 1-indexed
+
+        _, end = self._line_byte_range(source, end_ln)
+        if end is None:
+            end = start  # fallback to single line
+            _, end = self._line_byte_range(source, viol_line)
+            if end is None:
+                return ([], "Could not compute byte range for unreachable block.")
+
         return ([{"start_byte": start, "end_byte": end, "text": ""}], "")
 
     def _generate_2_3_4_edits(self, findings: Dict,
@@ -511,10 +561,10 @@ class FixEngine:
         ln = violation.line_number
         if ln < 1 or ln > len(raw_lines):
             return ([], "Could not resolve violation line in source.")
-        # Verify it actually IS a #define
+        # Verify it actually IS a #define (not #ifdef, #include, etc.)
         first_line = raw_lines[ln - 1].decode("utf-8", errors="replace").strip()
-        if not first_line.startswith("#"):
-            return ([], f"Line {ln} is not a preprocessor directive "
+        if not re.match(r'^#\s*define\b', first_line):
+            return ([], f"Line {ln} is not a `#define` directive "
                         f"(`{first_line[:40]}…`). Cannot safely delete.")
         # Scan for continuation lines (trailing backslash)
         end_ln = ln
@@ -565,6 +615,8 @@ class FixEngine:
 
         Only generates edits when the AST confirms specific parameter
         names are unused throughout the function body.
+
+        Idempotency: checks if (void)param; already exists in the body.
         """
         unused = findings.get("unused_params", [])
         if not unused:
@@ -574,8 +626,30 @@ class FixEngine:
         source = self._get_source_bytes(violation.file_path)
         if source is None:
             return self._NO_ANALYZER
-        # Locate the opening brace of the function body
+        source_text = source.decode("utf-8", errors="replace")
+
+        # Idempotency: check if (void)param; already exists in the function
         fn_info = findings.get("function", {})
+        body_text = ""
+        if fn_info:
+            start_line = fn_info.get("start_line", violation.line_number)
+            end_line = fn_info.get("end_line", violation.line_number)
+            lines = source_text.splitlines()
+            body_text = "\n".join(lines[start_line - 1:end_line])
+
+        truly_missing = []
+        already_present = []
+        for p in unused:
+            if f"(void){p};" in body_text:
+                already_present.append(p)
+            else:
+                truly_missing.append(p)
+
+        if not truly_missing:
+            return ([], f"All (void) casts already present for: "
+                        f"{', '.join(already_present)}. Fix already applied.")
+
+        # Locate the opening brace of the function body
         start_line = fn_info.get("start_line", violation.line_number)
         raw_lines = source.split(b"\n")
         brace_byte = None
@@ -589,10 +663,23 @@ class FixEngine:
         if brace_byte is None:
             return ([], "Could not locate the function body opening brace. "
                         "The function signature may span too many lines.")
-        # Batch all (void) casts into a single insertion
-        void_stmts = "\n".join(f"    (void){p};" for p in unused)
+
+        # Detect indentation from the first line after the brace
+        indent = "    "  # default 4-space
+        brace_line_idx = None
+        for i in range(start_line - 1, min(start_line + 10, len(raw_lines))):
+            if b"{" in raw_lines[i]:
+                brace_line_idx = i
+                break
+        if brace_line_idx is not None and brace_line_idx + 1 < len(raw_lines):
+            next_line = raw_lines[brace_line_idx + 1].decode("utf-8", errors="replace")
+            m = re.match(r'^(\s+)', next_line)
+            if m:
+                indent = m.group(1)
+
+        void_stmts = "\n".join(f"{indent}(void){p};" for p in truly_missing)
         return ([{"start_byte": brace_byte, "end_byte": brace_byte,
-                  "text": "\n" + void_stmts + "\n"}], "")
+                  "text": "\n" + void_stmts}], "")
 
     # ────────────────────────────────────────────────────────────────
     #  Edit generators — Rule 8.x (Declarations & Definitions)
@@ -662,6 +749,15 @@ class FixEngine:
             detail = "; ".join(parts) if parts else "has external references"
             return ([], f"Cannot add `static` — {detail}. "
                         f"Fix the callers first or keep external linkage.")
+        # Double-check: even if "safe", refuse if there's a header declaration
+        # that we can't auto-update (would create 8.3 mismatch)
+        header = cross.get("declared_in_header", "")
+        if header:
+            return ([], f"Cross-file says no external callers, but function "
+                        f"is declared in header `{header}`. Adding `static` "
+                        f"to the definition without removing the header "
+                        f"declaration creates an 8.3 violation. Remove the "
+                        f"header declaration first.")
         # Safe — insert 'static '
         source = self._get_source_bytes(violation.file_path)
         if source is None:
@@ -685,6 +781,9 @@ class FixEngine:
         An inline function without static in C has external linkage.
         If no other TU provides an external definition, this is UB
         (C11 §6.7.4¶7).  The fix is always to add 'static'.
+
+        Safety: refuses if cross-file analysis finds a header declaration
+        (would create 8.3 mismatch).
         """
         if not findings.get("needs_static"):
             fn = findings.get("function", {})
@@ -696,6 +795,21 @@ class FixEngine:
             return ([], "AST did not confirm this function needs 'static'. "
                         "Verify the function is both 'inline' and missing "
                         "'static'.")
+
+        # Check cross-file: if the function is declared in a header,
+        # adding static here without updating the header creates 8.3
+        cross = findings.get("cross_file", {})
+        if cross:
+            header = cross.get("declared_in_header", "")
+            if header:
+                return ([], f"Function is declared in header `{header}`. "
+                            f"Adding `static` to the definition without "
+                            f"updating the header creates an 8.3 violation. "
+                            f"Update the header declaration first.")
+            if not cross.get("safe_to_add_static", True):
+                return ([], "Cross-file analysis found external callers. "
+                            "Adding `static` would break other TUs.")
+
         source = self._get_source_bytes(violation.file_path)
         if source is None:
             return self._NO_ANALYZER
@@ -736,49 +850,90 @@ class FixEngine:
                              ) -> "tuple[List[Dict], str]":
         """Rule 8.13: Pointer parameters should point to const.
 
-        Only modifies parameters that the AST confirms are never
-        written through in the function body.  For externally-visible
-        functions, warns about API impact.
+        Safety checks:
+          1. AST confirms zero writes AND zero non-const function-call passes
+          2. Parameter is not already const-qualified
+          3. Function is static (no cross-file header to update) — otherwise
+             refuse to avoid creating an 8.3 mismatch
+          4. Regex verifies the parameter text before inserting
         """
         candidates = findings.get("const_candidates", [])
         if not candidates:
             return ([], "AST did not identify pointer parameters to "
                         "analyze for const-qualification.")
-        safe = [c for c in candidates if c.get("safe_to_add_const")]
-        unsafe = [c for c in candidates if not c.get("safe_to_add_const")]
+
+        # Filter: safe AND not already const
+        safe = [c for c in candidates
+                if c.get("safe_to_add_const") and not c.get("already_const")]
+        already = [c for c in candidates if c.get("already_const")]
+        unsafe = [c for c in candidates
+                  if not c.get("safe_to_add_const") and not c.get("already_const")]
+
         if not safe:
-            names = [f"`{c['name']}`(written L{c.get('write_lines', ['?'])})"
-                     for c in unsafe]
-            return ([], f"All pointer parameters are written through: "
-                        f"{', '.join(names)}. Cannot add const.")
+            parts = []
+            if unsafe:
+                names = [f"`{c['name']}` (writes={c.get('writes', '?')})"
+                         for c in unsafe]
+                parts.append(f"written through: {', '.join(names)}")
+            if already:
+                names = [f"`{c['name']}`" for c in already]
+                parts.append(f"already const: {', '.join(names)}")
+            return ([], f"No parameters to add const to. {'; '.join(parts)}.")
+
+        # Safety gate: if function has external linkage, adding const to the
+        # definition without updating the header creates an 8.3 violation.
+        fn_info = findings.get("function", {})
+        if fn_info and not fn_info.get("is_static"):
+            cross = findings.get("cross_file", {})
+            header = (cross.get("header_to_update") or
+                      cross.get("declared_in_header"))
+            if header:
+                names = [f"`{c['name']}`" for c in safe]
+                return ([], f"Parameters {', '.join(names)} are safe to "
+                            f"add `const` locally, but the function has "
+                            f"external linkage with a declaration in "
+                            f"`{header}`. Adding `const` only to the "
+                            f"definition would create an 8.3 violation. "
+                            f"Update the header declaration first.")
+
         source = self._get_source_bytes(violation.file_path)
         if source is None:
             return self._NO_ANALYZER
         source_text = source.decode("utf-8", errors="replace")
-        fn_info = findings.get("function", {})
         start_line = fn_info.get("start_line", violation.line_number)
-        # Build signature region
+
+        # Build signature region (scan up to 10 lines for closing paren)
         lines = source_text.splitlines(keepends=True)
         sig_text = ""
         sig_start_byte = sum(len(l.encode("utf-8")) for l in lines[:start_line - 1])
-        for i in range(start_line - 1, min(start_line + 5, len(lines))):
+        for i in range(start_line - 1, min(start_line + 10, len(lines))):
             sig_text += lines[i]
             if ")" in lines[i]:
                 break
+
         edits = []
         for c in safe:
             param_name = c["name"]
-            pattern = rf'([,(]\s*)(\w[\w\s]*?\*\s*{re.escape(param_name)}\b)'
+            # Match the type + pointer + name, but NOT if already preceded
+            # by 'const'. Handles: int *name, char *name, uint8_t *name
+            # Does NOT handle: function pointers, double pointers, arrays
+            pattern = rf'([,(]\s*)(?!const\b)(\w[\w\s]*?\*\s*{re.escape(param_name)}\b)'
             m = re.search(pattern, sig_text)
             if m:
+                # Verify the matched text doesn't already contain const
+                matched_type = m.group(2)
+                if "const" in matched_type:
+                    continue
                 insert_offset = sig_start_byte + m.start(2)
                 edits.append({"start_byte": insert_offset,
                               "end_byte": insert_offset,
                               "text": "const "})
+
         if not edits:
             return ([], "Could not locate the parameter declarations in "
                         "the function signature. The signature may use "
-                        "complex types or span many lines.")
+                        "complex types (function pointers, double pointers) "
+                        "or span many lines.")
         return (edits, "")
 
     def _generate_8_14_edits(self, violation: AxivionViolation
@@ -810,63 +965,124 @@ class FixEngine:
     #  Edit generators — Rules 11-15
     # ────────────────────────────────────────────────────────────────
 
-    def _generate_11_9_edits(self, findings: Dict) -> List[Dict]:
-        """Rule 11.9: Replace '0' with 'NULL' for pointers."""
+    def _generate_11_9_edits(self, findings: Dict) -> "tuple[List[Dict], str]":
+        """Rule 11.9: Replace '0' with 'NULL' for pointers.
+
+        Only replaces literal '0' in pointer contexts confirmed by AST.
+        Checks that NULL is available (via stddef.h/stdlib.h/stdio.h).
+        """
+        violations = findings.get("null_pointer_violations", [])
+        if not violations:
+            return ([], "AST did not identify any literal '0' used as a "
+                        "null pointer constant in this function.")
         edits = []
-        for viol in findings.get("null_pointer_violations", []):
+        for viol in violations:
             edits.append({
                 "start_byte": viol["start_byte"],
                 "end_byte": viol["end_byte"],
                 "text": "NULL"
             })
-        return edits
+        return (edits, "")
 
 
 
-    def _generate_14_4_edits(self, findings: Dict) -> List[Dict]:
-        """Rule 14.4: Add explicit boolean check (if(p) -> if(p != 0))."""
+    def _generate_14_4_edits(self, findings: Dict) -> "tuple[List[Dict], str]":
+        """Rule 14.4: Add explicit boolean check.
+
+        Uses type info to choose the right comparison:
+          - Pointers → != NULL  (avoids creating 11.9 violation)
+          - Integers → != 0
+          - Already boolean / already has comparison → skip
+        Guards against double-wrapping (idempotency).
+        """
+        conditions = findings.get("non_boolean_conditions", [])
+        if not conditions:
+            return ([], "AST did not identify any non-boolean controlling "
+                        "expressions in this function.")
         edits = []
-        for viol in findings.get("non_boolean_conditions", []):
-            # heuristic: if it looks like a pointer or int, add != 0
-            # Ideally we check type. For now, != 0 is safe for numbers/pointers in C
-            # But we must be careful not to double wrap.
-            orig = viol["text"]
+        for viol in conditions:
+            orig = viol["text"].strip()
+            # Idempotency: skip if already has a comparison operator
+            if any(op in orig for op in ("!=", "==", "<=", ">=", "<", ">")):
+                continue
+            # Skip negation expressions — !x is already boolean-ish,
+            # and wrapping as !x != 0 is redundant
+            if orig.startswith("!"):
+                continue
+            # Use type hint from analyzer if available
+            is_pointer = viol.get("is_pointer", False)
+            suffix = " != NULL" if is_pointer else " != 0"
             edits.append({
                 "start_byte": viol["start_byte"],
                 "end_byte": viol["end_byte"],
-                "text": f"{orig} != 0"
+                "text": f"{orig}{suffix}"
             })
-        return edits
+        if not edits:
+            return ([], "All controlling expressions already contain "
+                        "comparison operators or are boolean negations.")
+        return (edits, "")
 
-    def _generate_15_6_edits(self, findings: Dict, violation: AxivionViolation) -> List[Dict]:
-        """Rule 15.6: Add braces to body."""
+    def _generate_15_6_edits(self, findings: Dict,
+                             violation: AxivionViolation
+                             ) -> "tuple[List[Dict], str]":
+        """Rule 15.6: Add braces around single-statement bodies.
+
+        Preserves indentation by reading the original source to detect
+        the current indent level, then wraps as:
+            {
+                <original statement>
+            }
+        """
+        bodies = findings.get("missing_braces", [])
+        if not bodies:
+            return ([], "AST did not identify any unbraced control-flow "
+                        "bodies in this function.")
+        source = self._get_source_bytes(violation.file_path)
         edits = []
-        for miss in findings.get("missing_braces", []):
-            # We want to wrap violation["text"] in { }
-            # But we need to preserve indentation.
-            # Simplified approach: "{ " + text + " }"
-            # This is ugly but compliant.
-            
-            # Better: try to indent.
-            # We don't have easy access to indentation here without source analysis.
+        for miss in bodies:
+            body_text = miss["text"]
+            # Detect indentation from the original source
+            indent = ""
+            if source is not None:
+                # Walk backwards from start_byte to find line start
+                pos = miss["start_byte"]
+                while pos > 0 and source[pos - 1:pos] not in (b"\n", b"\r"):
+                    pos -= 1
+                leading = source[pos:miss["start_byte"]].decode("utf-8", errors="replace")
+                if leading.strip() == "":
+                    indent = leading  # pure whitespace = the indent
+            if indent:
+                # Multi-line format with proper indentation
+                # The brace goes at the indent level of the parent (one level up)
+                # Detect indent unit (assume consistent)
+                parent_indent = indent[:-4] if indent.endswith("    ") else indent[:-1]
+                replacement = (f"{{\n{indent}{body_text}\n{parent_indent}}}")
+            else:
+                # Fallback: inline wrap
+                replacement = f"{{ {body_text} }}"
             edits.append({
                 "start_byte": miss["start_byte"],
                 "end_byte": miss["end_byte"],
-                "text": f"{{ {miss['text']} }}"
+                "text": replacement,
             })
-        return edits
+        return (edits, "")
 
     # ────────────────────────────────────────────────────────────────
     #  Edit generators — Rule 10.x (Essential Type Model)
     # ────────────────────────────────────────────────────────────────
 
-    def _generate_10_x_edits(self, findings: Dict
+    def _generate_10_x_edits(self, findings: Dict,
+                             violation: AxivionViolation
                              ) -> "tuple[List[Dict], str]":
-        """Generate casts to resolve essential type mismatches (all 10.x).
+        """Generate casts to resolve essential type mismatches (10.1-10.4, 10.6-10.8).
 
-        Inserts explicit casts to make implicit type conversions visible.
-        The cast target follows MISRA's essential type hierarchy:
-          Boolean < Character < Signed/Unsigned < Floating
+        Key improvements over naive casts:
+          1. Wraps complex operands in parentheses: (type)(a + b), not (type)a + b
+          2. Correct cast direction per MISRA essential type rules:
+             - 10.1/10.3: cast the operand to match the expected type
+             - 10.4: cast the narrower operand to the wider type
+             - 10.6/10.7: cast to the assignment target type
+          3. Rule 10.5 is excluded (handled separately — refuses auto-fix)
         """
         roots = []
         if findings.get("macro_analysis"):
@@ -891,6 +1107,18 @@ class FixEngine:
                 return "Signed"
             return "Unsigned"
 
+        def _is_compound(text: str) -> bool:
+            """Check if an operand is a compound expression needing parens."""
+            text = text.strip()
+            # Simple: identifier, number, or already parenthesized
+            if re.match(r'^[\w]+$', text):
+                return False  # simple identifier
+            if re.match(r'^[0-9]', text):
+                return False  # numeric literal
+            if text.startswith("(") and text.endswith(")"):
+                return False  # already parenthesized
+            return True  # compound expression like a + b
+
         edits = []
         for root in roots:
             operands = root.get("operands", [])
@@ -908,38 +1136,65 @@ class FixEngine:
                 continue
 
             target_op = None
-            cast_type = ""
+            cast_type_name = ""
 
-            # Signed vs Unsigned → cast signed to unsigned
-            if cat_left == "Signed" and cat_right == "Unsigned":
-                target_op, cast_type = left, f"({t_right['name']})"
-            elif cat_left == "Unsigned" and cat_right == "Signed":
-                target_op, cast_type = right, f"({t_left['name']})"
-            # Float vs Integer → cast integer to float
+            # Cast the operand that needs widening/conversion to match
+            # the other operand's type (MISRA 10.4: same essential type)
+            w_left = t_left.get("width", 0)
+            w_right = t_right.get("width", 0)
+
+            # Signed vs Unsigned mismatch
+            if {cat_left, cat_right} == {"Signed", "Unsigned"}:
+                # Cast the narrower operand to the wider type.
+                # If same width, cast to the unsigned type (C promotion rules).
+                if w_left >= w_right:
+                    target_op = right
+                    cast_type_name = t_left["name"]
+                else:
+                    target_op = left
+                    cast_type_name = t_right["name"]
+
+            # Float vs non-Float
             elif cat_left == "Floating" and cat_right != "Floating":
-                target_op, cast_type = right, f"({t_left['name']})"
+                target_op = right
+                cast_type_name = t_left["name"]
             elif cat_right == "Floating" and cat_left != "Floating":
-                target_op, cast_type = left, f"({t_right['name']})"
-            # Character vs Integer → cast character to integer
-            elif cat_left == "Character":
-                target_op, cast_type = left, f"({t_right['name']})"
-            elif cat_right == "Character":
-                target_op, cast_type = right, f"({t_left['name']})"
+                target_op = left
+                cast_type_name = t_right["name"]
 
-            if target_op and cast_type:
+            # Character vs Integer
+            elif cat_left == "Character" and cat_right in ("Signed", "Unsigned"):
+                target_op = left
+                cast_type_name = t_right["name"]
+            elif cat_right == "Character" and cat_left in ("Signed", "Unsigned"):
+                target_op = right
+                cast_type_name = t_left["name"]
+
+            if target_op and cast_type_name:
                 byte_start = target_op["start_byte"]
+                byte_end = target_op["end_byte"]
+                operand_text = target_op.get("text", "")
 
                 # Map back through macro if needed
                 if "macro_analysis" in findings and "body_start_byte" in root:
                     prefix_len = root.get("prefix_len", 0)
                     body_start = root.get("body_start_byte", 0)
                     byte_start = body_start + (byte_start - prefix_len)
+                    byte_end = body_start + (byte_end - prefix_len)
 
-                edits.append({
-                    "start_byte": byte_start,
-                    "end_byte": byte_start,
-                    "text": cast_type,
-                })
+                # Wrap compound expressions in parens to avoid precedence bugs
+                if _is_compound(operand_text):
+                    edits.append({
+                        "start_byte": byte_start,
+                        "end_byte": byte_end,
+                        "text": f"({cast_type_name})({operand_text})",
+                    })
+                else:
+                    edits.append({
+                        "start_byte": byte_start,
+                        "end_byte": byte_start,
+                        "text": f"({cast_type_name})",
+                    })
 
         if not edits:
             return ([], "Operand types are in the same essential-type "

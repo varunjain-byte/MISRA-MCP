@@ -158,35 +158,64 @@ def test_extended_autofixes():
 
     fixer = FixEngine()
 
-    # 1. Test Rule 15.6 (Missing Braces)
+    # 1. Test Rule 15.6 (Missing Braces) — now returns (edits, skip_reason)
+    #    Without a real violation (no file path), falls back to inline wrap
+    from core.axivion_parser import AxivionViolation
+    dummy_viol = AxivionViolation(
+        rule_id="MisraC2012-15.6", message="test",
+        file_path="nonexistent.c", line_number=1,
+        severity="Required"
+    )
     findings_15_6 = {
         "missing_braces": [
             {"start_byte": 10, "end_byte": 20, "text": "x++;"}
         ]
     }
-    edits = fixer._generate_15_6_edits(findings_15_6, None)
+    edits, skip = fixer._generate_15_6_edits(findings_15_6, dummy_viol)
     assert len(edits) == 1
-    assert edits[0]["text"] == "{ x++; }"
+    assert "x++;" in edits[0]["text"]
+    assert "{" in edits[0]["text"] and "}" in edits[0]["text"]
     print("  Rule 15.6 (Braces) fix generated ✓")
 
-    # 2. Test Rule 14.4 (Boolean Check)
+    # 2. Test Rule 14.4 (Boolean Check) — now returns (edits, skip_reason)
     findings_14_4 = {
         "non_boolean_conditions": [
-            {"start_byte": 5, "end_byte": 6, "text": "p"}
+            {"start_byte": 5, "end_byte": 6, "text": "p", "is_pointer": False}
         ]
     }
-    edits = fixer._generate_14_4_edits(findings_14_4)
+    edits, skip = fixer._generate_14_4_edits(findings_14_4)
     assert len(edits) == 1
     assert edits[0]["text"] == "p != 0"
-    print("  Rule 14.4 (Boolean) fix generated ✓")
+    print("  Rule 14.4 (Boolean int) fix generated ✓")
 
-    # 3. Test Rule 11.9 (NULL)
+    # 2b. Test pointer uses != NULL
+    findings_14_4_ptr = {
+        "non_boolean_conditions": [
+            {"start_byte": 5, "end_byte": 6, "text": "ptr", "is_pointer": True}
+        ]
+    }
+    edits, skip = fixer._generate_14_4_edits(findings_14_4_ptr)
+    assert len(edits) == 1
+    assert edits[0]["text"] == "ptr != NULL"
+    print("  Rule 14.4 (Boolean ptr) fix generated ✓")
+
+    # 2c. Test idempotency — already has comparison
+    findings_14_4_idem = {
+        "non_boolean_conditions": [
+            {"start_byte": 5, "end_byte": 10, "text": "x != 0", "is_pointer": False}
+        ]
+    }
+    edits, skip = fixer._generate_14_4_edits(findings_14_4_idem)
+    assert len(edits) == 0
+    print("  Rule 14.4 (idempotency) correctly skips ✓")
+
+    # 3. Test Rule 11.9 (NULL) — now returns (edits, skip_reason)
     findings_11_9 = {
         "null_pointer_violations": [
             {"start_byte": 100, "end_byte": 101, "text": "0"}
         ]
     }
-    edits = fixer._generate_11_9_edits(findings_11_9)
+    edits, skip = fixer._generate_11_9_edits(findings_11_9)
     assert len(edits) == 1
     assert edits[0]["text"] == "NULL"
     print("  Rule 11.9 (NULL) fix generated ✓")
