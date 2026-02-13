@@ -32,5 +32,11 @@ void public_function(void) { /* intentionally empty */ }
 /* Rule 8.8: NOT in any header — should be static */
 void internal_helper(void) { /* only used in this file */ }
 
+/* Rule 8.2: definition has named params — header does not */
+int format_output(int width, const char *text) { return width; }
+
 /* Rule 8.6: only defined here (no duplicate) */
 int global_counter = 0;
+
+/* Rule 8.11: array definition with explicit size */
+int lookup_table[5] = {10, 20, 30, 40, 50};

@@ -18,6 +18,9 @@ int compute_sum(int *values, int count);
 /* Rule 8.8 test: declared in header = has external linkage */
 void public_function(void);
 
+/* Rule 8.2 test: declaration with unnamed parameters */
+int format_output(int, const char *);
+
 /* Macro for testing */
 #define MAX_BUFFER_SIZE 1024
 

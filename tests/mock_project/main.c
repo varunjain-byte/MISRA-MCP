@@ -8,6 +8,9 @@ extern int shared_var;
 /* Rule 8.6 test: another definition of global_counter (violates ODR) */
 int global_counter = 0;
 
+/* Rule 8.11 test: extern array without explicit size */
+extern int lookup_table[];
+
 int main(void) {
   int result;
   int data[5] = {1, 2, 3, 4, 5};
