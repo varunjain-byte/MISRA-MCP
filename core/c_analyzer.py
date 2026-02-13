@@ -1259,7 +1259,7 @@ class CAnalyzer:
             # If multi-line, we might include them if they start or end on this line?
             # Let's restrict to nodes identified as expressions on this line.
             if start_line <= line <= end_line:
-                if node.type in ("binary_expression", "assignment_expression", "cast_expression"):
+                if node.type in ("binary_expression", "assignment_expression", "cast_expression", "init_declarator"):
                     logger.debug("Found %s at %d-%d", node.type, start_line, end_line)
                     # Avoid duplicates (tree walk visits same node once, but avoid logic errors)
                     if node.id in seen:
@@ -1324,14 +1324,84 @@ class CAnalyzer:
              t_op = self.get_expression_type(val_node, source)
              info["operands"] = [
                  {
-                     "text": info["operand"], 
-                     "start_byte": val_node.start_byte, 
+                     "text": info["operand"],
+                     "start_byte": val_node.start_byte,
                      "end_byte": val_node.end_byte,
                      "type": t_op.__dict__ if t_op else None
                  }
              ]
 
+        # Assignment expression: lhs = rhs
+        elif node.type == "assignment_expression":
+            operator = None
+            for child in node.children:
+                if child.type in ("=", "+=", "-=", "*=", "/=", "%=",
+                                  "<<=", ">>=", "&=", "^=", "|="):
+                    operator = child.text.decode() if hasattr(child.text, 'decode') else str(child.text)
+                    break
+            # Skip compound assignments — too complex to cast safely
+            if operator and operator != "=":
+                return info
+            lhs = node.child_by_field_name("left")
+            rhs = node.child_by_field_name("right")
+            if lhs and rhs:
+                info["operator"] = "="
+                lhs_type = self._resolve_identifier_type(lhs, source)
+                rhs_type = self.get_expression_type(rhs, source)
+                info["operands"] = [
+                    {
+                        "text": self._node_text(rhs, source),
+                        "start_byte": rhs.start_byte,
+                        "end_byte": rhs.end_byte,
+                        "type": rhs_type.__dict__ if rhs_type else None,
+                        "target_type": lhs_type.__dict__ if lhs_type else None,
+                    }
+                ]
+
+        # Init declarator: type x = expr;
+        elif node.type == "init_declarator":
+            value = node.child_by_field_name("value")
+            if value:
+                decl_type = self._extract_init_declarator_type(node, source)
+                val_type = self.get_expression_type(value, source)
+                info["operator"] = "="
+                info["operands"] = [
+                    {
+                        "text": self._node_text(value, source),
+                        "start_byte": value.start_byte,
+                        "end_byte": value.end_byte,
+                        "type": val_type.__dict__ if val_type else None,
+                        "target_type": decl_type.__dict__ if decl_type else None,
+                    }
+                ]
+
         return info
+
+    def _extract_init_declarator_type(self, init_decl_node: Node, source: bytes) -> Optional["CType"]:
+        """Walk up to parent 'declaration' node and extract the type specifier.
+
+        For ``uint8_t x = expr;`` the tree-sitter AST looks like:
+            declaration
+              type_identifier "uint8_t"
+              init_declarator
+                identifier "x"
+                = "="
+                <value>
+        We collect all type-related children before the first init_declarator.
+        """
+        parent = init_decl_node.parent
+        if parent and parent.type == "declaration":
+            type_parts: list[str] = []
+            for child in parent.children:
+                if child.type in ("type_identifier", "primitive_type",
+                                  "sized_type_specifier", "type_qualifier"):
+                    type_parts.append(self._node_text(child, source))
+                elif child.type == "init_declarator":
+                    break  # stop before declarator
+            if type_parts:
+                type_name = " ".join(type_parts)
+                return self.type_system.get_type(type_name)
+        return None
 
     # ────────────────────────────────────────────────────────────────
     #  Type Inference

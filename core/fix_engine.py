@@ -1120,6 +1120,48 @@ class FixEngine:
             return True  # compound expression like a + b
 
         edits = []
+
+        # ── Assignment / init-declarator path ──
+        # These have a single operand with a "target_type" field.
+        # Always cast the RHS to the declared LHS type.
+        for root in roots:
+            operands = root.get("operands", [])
+            if len(operands) != 1:
+                continue
+            op = operands[0]
+            target = op.get("target_type")
+            if not target or not isinstance(target, dict):
+                continue
+            target_name = target.get("name", "")
+            if not target_name or target_name == "unknown":
+                continue
+            # Skip pointer assignments — rule 11.x territory
+            if target.get("is_pointer") or (op.get("type") or {}).get("is_pointer"):
+                continue
+            if "*" in target_name or "*" in (op.get("type") or {}).get("name", ""):
+                continue
+            # Skip if source and target are same essential type category
+            src_type = op.get("type")
+            if src_type:
+                src_cat = get_category(src_type)
+                tgt_cat = get_category(target)
+                if src_cat == tgt_cat:
+                    continue
+            text = op.get("text", "")
+            if _is_compound(text):
+                cast_expr = f"({target_name})({text})"
+            else:
+                cast_expr = f"({target_name}){text}"
+            edits.append({
+                "start_byte": op["start_byte"],
+                "end_byte": op["end_byte"],
+                "text": cast_expr,
+            })
+
+        if edits:
+            return (edits, "")
+
+        # ── Binary expression path (original logic) ──
         for root in roots:
             operands = root.get("operands", [])
             if len(operands) < 2:

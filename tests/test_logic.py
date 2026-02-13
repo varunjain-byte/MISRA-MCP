@@ -221,6 +221,149 @@ def test_extended_autofixes():
     print("  Rule 11.9 (NULL) fix generated ✓")
 
 
+def test_10x_assignment_handling():
+    """Test that 10.x fixer handles assignment and init-declarator expressions."""
+    section("10.x ASSIGNMENT / INIT-DECLARATOR HANDLING")
+
+    import tempfile, json
+    fixer = FixEngine()
+
+    # ── Test 1: Init-declarator — uint8_t x = some_int32_val; ──
+    c_code_init = b'uint8_t x = some_int32_val;\n'
+    with tempfile.NamedTemporaryFile(suffix='.c', delete=False, mode='wb') as f:
+        f.write(c_code_init)
+        tmp_init = f.name
+
+    try:
+        analyzer = CAnalyzer(os.path.dirname(tmp_init))
+        exprs = analyzer._analyze_expression_at_line(tmp_init, 1)
+        # Should find the init_declarator
+        found_init = any(e.get("type") == "init_declarator" for e in exprs)
+        assert found_init, f"Expected init_declarator, got: {[e.get('type') for e in exprs]}"
+        print("  Init-declarator node found ✓")
+
+        # Check operands have target_type
+        for e in exprs:
+            if e.get("type") == "init_declarator":
+                ops = e.get("operands", [])
+                assert len(ops) == 1, f"Expected 1 operand, got {len(ops)}"
+                assert ops[0].get("target_type") is not None, "target_type missing"
+                assert ops[0]["target_type"].get("name") == "uint8_t", \
+                    f"Expected uint8_t target, got {ops[0]['target_type'].get('name')}"
+                print("  Init-declarator target_type=uint8_t ✓")
+    finally:
+        os.unlink(tmp_init)
+
+    # ── Test 2: Assignment expression — x = signed_expr; ──
+    c_code_assign = b'void f(void) {\n  uint16_t x;\n  int32_t y = 42;\n  x = y;\n}\n'
+    with tempfile.NamedTemporaryFile(suffix='.c', delete=False, mode='wb') as f:
+        f.write(c_code_assign)
+        tmp_assign = f.name
+
+    try:
+        analyzer = CAnalyzer(os.path.dirname(tmp_assign))
+        exprs = analyzer._analyze_expression_at_line(tmp_assign, 4)
+        found_assign = any(e.get("type") == "assignment_expression" for e in exprs)
+        assert found_assign, f"Expected assignment_expression, got: {[e.get('type') for e in exprs]}"
+        print("  Assignment expression node found ✓")
+
+        for e in exprs:
+            if e.get("type") == "assignment_expression":
+                ops = e.get("operands", [])
+                assert len(ops) == 1, f"Expected 1 operand, got {len(ops)}"
+                assert ops[0].get("target_type") is not None, "target_type missing"
+                print(f"  Assignment target_type={ops[0]['target_type'].get('name')} ✓")
+    finally:
+        os.unlink(tmp_assign)
+
+    # ── Test 3: Compound assignment (+=) should be skipped ──
+    c_code_compound = b'void f(void) {\n  uint16_t x = 0;\n  x += 1;\n}\n'
+    with tempfile.NamedTemporaryFile(suffix='.c', delete=False, mode='wb') as f:
+        f.write(c_code_compound)
+        tmp_compound = f.name
+
+    try:
+        analyzer = CAnalyzer(os.path.dirname(tmp_compound))
+        exprs = analyzer._analyze_expression_at_line(tmp_compound, 3)
+        for e in exprs:
+            if e.get("type") == "assignment_expression":
+                ops = e.get("operands", [])
+                assert len(ops) == 0, f"Compound assignment should have no operands, got {len(ops)}"
+                print("  Compound assignment (+=) correctly skipped ✓")
+    finally:
+        os.unlink(tmp_compound)
+
+    # ── Test 4: _generate_10_x_edits with assignment target_type ──
+    findings_assign = {
+        "expressions": [
+            {
+                "type": "assignment_expression",
+                "operands": [
+                    {
+                        "text": "y",
+                        "start_byte": 50,
+                        "end_byte": 51,
+                        "type": {"name": "int32_t", "width": 32, "is_signed": True, "is_float": False, "is_pointer": False},
+                        "target_type": {"name": "uint8_t", "width": 8, "is_signed": False, "is_float": False, "is_pointer": False},
+                    }
+                ]
+            }
+        ]
+    }
+    from core.axivion_parser import AxivionViolation
+    dummy_v = AxivionViolation(
+        rule_id="MisraC2012-10.3", message="test",
+        file_path="test.c", line_number=4, severity="Required"
+    )
+    edits, skip = fixer._generate_10_x_edits(findings_assign, dummy_v)
+    assert len(edits) == 1, f"Expected 1 edit, got {len(edits)}"
+    assert edits[0]["text"] == "(uint8_t)y", f"Expected '(uint8_t)y', got '{edits[0]['text']}'"
+    print("  _generate_10_x_edits assignment cast ✓")
+
+    # ── Test 5: Pointer assignment should be skipped ──
+    findings_ptr = {
+        "expressions": [
+            {
+                "type": "assignment_expression",
+                "operands": [
+                    {
+                        "text": "p",
+                        "start_byte": 10,
+                        "end_byte": 11,
+                        "type": {"name": "void *", "width": 64, "is_signed": False, "is_float": False, "is_pointer": True},
+                        "target_type": {"name": "int *", "width": 64, "is_signed": False, "is_float": False, "is_pointer": True},
+                    }
+                ]
+            }
+        ]
+    }
+    edits, skip = fixer._generate_10_x_edits(findings_ptr, dummy_v)
+    assert len(edits) == 0, f"Pointer assignment should produce no edits, got {len(edits)}"
+    print("  Pointer assignment correctly skipped ✓")
+
+    # ── Test 6: Compound RHS expression gets parenthesized ──
+    findings_compound_rhs = {
+        "expressions": [
+            {
+                "type": "init_declarator",
+                "operands": [
+                    {
+                        "text": "a + b",
+                        "start_byte": 20,
+                        "end_byte": 25,
+                        "type": {"name": "int", "width": 32, "is_signed": True, "is_float": False, "is_pointer": False},
+                        "target_type": {"name": "uint8_t", "width": 8, "is_signed": False, "is_float": False, "is_pointer": False},
+                    }
+                ]
+            }
+        ]
+    }
+    edits, skip = fixer._generate_10_x_edits(findings_compound_rhs, dummy_v)
+    assert len(edits) == 1, f"Expected 1 edit, got {len(edits)}"
+    assert edits[0]["text"] == "(uint8_t)(a + b)", f"Expected '(uint8_t)(a + b)', got '{edits[0]['text']}'"
+    print("  Compound RHS parenthesized ✓")
+
+
 def run_tests():
     print("=" * 72)
     print("  COMPREHENSIVE MISRA AGENT TEST SUITE (AST-aware)")
@@ -251,6 +394,9 @@ def run_tests():
 
     # 7. EXTENDED FIXES
     test_extended_autofixes()
+
+    # 8. 10.x ASSIGNMENT HANDLING
+    test_10x_assignment_handling()
 
     print("\n" + "=" * 72)
     print("  ALL TESTS PASSED ✓")
