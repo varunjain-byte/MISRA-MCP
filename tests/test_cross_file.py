@@ -319,6 +319,46 @@ class TestRule8_8CrossFile(unittest.TestCase):
         self.assertTrue(result["safe_to_add_static"])
 
 
+class TestRule8_2CrossFile(unittest.TestCase):
+    """Rule 8.2: Copy param names from definition to unnamed declaration."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.index = WorkspaceIndex(MOCK_PROJECT)
+        cls.index.build()
+
+    def test_format_output_has_definition_params(self):
+        """format_output definition has named params (width, text)."""
+        result = self.index.check_rule_8_2("format_output")
+        self.assertIsNotNone(result["definition_file"])
+        self.assertEqual(len(result["definition_params"]), 2)
+
+    def test_unknown_function_no_params(self):
+        """Unknown function returns empty param list."""
+        result = self.index.check_rule_8_2("nonexistent_function_xyz")
+        self.assertEqual(result["definition_params"], [])
+
+
+class TestRule8_11CrossFile(unittest.TestCase):
+    """Rule 8.11: Resolve extern array size from definition."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.index = WorkspaceIndex(MOCK_PROJECT)
+        cls.index.build()
+
+    def test_lookup_table_has_size(self):
+        """lookup_table is defined with [5] in utils.c."""
+        result = self.index.check_rule_8_11("lookup_table")
+        self.assertEqual(result["array_size"], "5")
+        self.assertEqual(result["definition_file"], "utils.c")
+
+    def test_unknown_array_no_size(self):
+        """Unknown symbol returns None for array_size."""
+        result = self.index.check_rule_8_11("nonexistent_array_xyz")
+        self.assertIsNone(result["array_size"])
+
+
 class TestRule8_13CrossFile(unittest.TestCase):
     """Rule 8.13: Caller impact for adding const."""
 
@@ -385,6 +425,24 @@ class TestCAnalyzerCrossFile(unittest.TestCase):
         )
         if result.get("cross_file"):
             self.assertGreater(result["cross_file"]["total_callers"], 0)
+
+    def test_rule_8_2_cross_file_enrichment(self):
+        """Rule 8.2 for format_output should find definition params."""
+        # format_output declaration is at line 22 in utils.h
+        result = self.analyzer.analyze_for_rule(
+            "utils.h", 22, "MisraC2012-8.2"
+        )
+        self.assertIn("cross_file", result)
+        self.assertGreater(len(result["cross_file"]["definition_params"]), 0)
+
+    def test_rule_8_11_cross_file_enrichment(self):
+        """Rule 8.11 for lookup_table should find array size."""
+        # extern int lookup_table[]; is at line 12 in main.c
+        result = self.analyzer.analyze_for_rule(
+            "main.c", 12, "MisraC2012-8.11"
+        )
+        self.assertIn("cross_file", result)
+        self.assertEqual(result["cross_file"]["array_size"], "5")
 
     def test_without_index(self):
         """CAnalyzer without index should still work but no cross_file."""
@@ -463,9 +521,9 @@ class TestHeaderFileAnalysis(unittest.TestCase):
     # ── Declarations from headers ──
 
     def test_all_function_decls_from_utils_h(self):
-        """All 5 function declarations in utils.h should be indexed."""
+        """All 6 function declarations in utils.h should be indexed."""
         expected = {"add_numbers", "multiply_values", "process_data",
-                    "compute_sum", "public_function"}
+                    "compute_sum", "public_function", "format_output"}
         decls = self.index.symbols.find_declarations
         found = set()
         for name in expected:

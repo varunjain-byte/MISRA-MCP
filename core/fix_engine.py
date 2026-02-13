@@ -395,9 +395,7 @@ class FixEngine:
         if rid == "MisraC2012-8.10":
             return self._generate_8_10_edits(findings, violation)
         if rid == "MisraC2012-8.11":
-            return ([], "Rule 8.11 (explicit array size) requires knowing "
-                        "the intended array size, which depends on the "
-                        "definition in another translation unit.")
+            return self._generate_8_11_edits(findings, violation)
         if rid == "MisraC2012-8.12":
             return self._generate_8_12_edits(findings, violation)
         if rid == "MisraC2012-8.13":
@@ -685,10 +683,13 @@ class FixEngine:
     def _generate_8_2_edits(self, findings: Dict,
                             violation: AxivionViolation
                             ) -> "tuple[List[Dict], str]":
-        """Rule 8.2: Function types shall be in prototype form.
+        """Rule 8.2: Function types shall be in prototype form with named params.
 
-        Auto-fixes the common case: `int f()` → `int f(void)`.
-        Only safe when the empty parens literally appear on the line.
+        Handles two cases:
+          1. Empty parens `int f()` → `int f(void)`
+          2. Unnamed params `int f(int, int)` → `int f(int a, int b)`
+             when the definition's param names are available via cross-file
+             analysis.
         """
         source = self._get_source_bytes(violation.file_path)
         if source is None:
@@ -697,18 +698,77 @@ class FixEngine:
         if start is None:
             return ([], "Could not resolve violation line in source.")
         line_text = source[start:end].decode("utf-8", errors="replace")
-        # Match empty parameter list: "name()" or "name( )"
+
+        # Case 1: Empty parameter list `f()` → `f(void)`
         m = re.search(r'(\w+)\s*\(\s*\)', line_text)
         if m:
             paren_start = start + line_text.index("(") + 1
             paren_end = start + line_text.index(")")
-            # Handle whitespace inside parens
-            inner = source[paren_start:paren_end]
             return ([{"start_byte": paren_start, "end_byte": paren_end,
                        "text": "void"}], "")
-        return ([], "Could not find empty parameter list `()` on the "
-                    "violation line. The function may already have "
-                    "parameters, or the signature may span multiple lines.")
+
+        # Case 2: Unnamed params — use definition param names from cross-file
+        cross = findings.get("cross_file", {})
+        def_params = cross.get("definition_params", [])
+        if not def_params:
+            return ([], "Could not find empty parameter list `()` on the "
+                        "violation line. The function may already have "
+                        "parameters, or the signature may span multiple lines.")
+
+        # Find the parameter list on the violation line: `(int, float *)`
+        paren_m = re.search(r'\(([^)]+)\)', line_text)
+        if not paren_m:
+            return ([], "Could not locate parameter list on violation line.")
+
+        decl_param_str = paren_m.group(1)
+        decl_params = [p.strip() for p in decl_param_str.split(",")]
+
+        if len(decl_params) != len(def_params):
+            return ([], "Parameter count in declaration does not match "
+                        "definition. Manual review required.")
+
+        # Build named params: for each decl param like "int" or "const char *",
+        # extract the param name from the definition's full param string.
+        named_params = []
+        for decl_p, def_p in zip(decl_params, def_params):
+            # Extract the name from the definition param (last identifier token)
+            name_match = re.search(r'(\w+)\s*(?:\[\s*\])?\s*$', def_p)
+            if not name_match:
+                return ([], f"Cannot extract param name from definition "
+                            f"param `{def_p}`.")
+            param_name = name_match.group(1)
+
+            # Check if the declaration param already contains that name
+            # (i.e. already has a name — skip to avoid double-naming)
+            decl_name_m = re.search(r'(\w+)\s*(?:\[\s*\])?\s*$', decl_p)
+            if decl_name_m:
+                decl_last_word = decl_name_m.group(1)
+                # If the last word is a type keyword, it's unnamed
+                type_keywords = {
+                    "int", "char", "short", "long", "float", "double",
+                    "void", "signed", "unsigned", "bool", "size_t",
+                    "uint8_t", "uint16_t", "uint32_t", "uint64_t",
+                    "int8_t", "int16_t", "int32_t", "int64_t",
+                }
+                if decl_last_word not in type_keywords and "*" not in decl_p.split()[-1]:
+                    # Already has a name
+                    named_params.append(decl_p)
+                    continue
+
+            # Append name to the declaration type
+            # Handle pointer params: "const char *" → "const char *name"
+            if decl_p.rstrip().endswith("*"):
+                named_params.append(f"{decl_p}{param_name}")
+            else:
+                named_params.append(f"{decl_p} {param_name}")
+
+        new_param_str = ", ".join(named_params)
+        paren_content_start = start + paren_m.start(1)
+        paren_content_end = start + paren_m.end(1)
+
+        return ([{"start_byte": paren_content_start,
+                  "end_byte": paren_content_end,
+                  "text": new_param_str}], "")
 
     def _generate_8_4_edits(self, findings: Dict,
                             violation: AxivionViolation
@@ -876,6 +936,52 @@ class FixEngine:
         return ([], "Could not locate 'inline' keyword on the violation "
                     "line. The keyword may be on a different line of a "
                     "multi-line declaration.")
+
+    def _generate_8_11_edits(self, findings: Dict,
+                             violation: AxivionViolation
+                             ) -> "tuple[List[Dict], str]":
+        """Rule 8.11: Extern array shall have explicit size.
+
+        When cross-file analysis locates the definition and its size,
+        replaces `arr[]` with `arr[SIZE]` in the extern declaration.
+        Falls back to a refusal if the size cannot be determined.
+        """
+        cross = findings.get("cross_file", {})
+        array_size = cross.get("array_size") if cross else None
+        if not array_size:
+            return ([], "Rule 8.11 (explicit array size) requires knowing "
+                        "the intended array size, which depends on the "
+                        "definition in another translation unit.")
+
+        source = self._get_source_bytes(violation.file_path)
+        if source is None:
+            return self._NO_ANALYZER
+        start, end = self._line_byte_range(source, violation.line_number)
+        if start is None:
+            return ([], "Could not resolve violation line in source.")
+        line_text = source[start:end].decode("utf-8", errors="replace")
+
+        # Find `symbol[]` or `symbol[ ]` on the violation line
+        sym = cross.get("symbol", "")
+        if sym:
+            pattern = re.escape(sym) + r'\s*\[\s*\]'
+        else:
+            # Fallback: match any identifier followed by empty brackets
+            pattern = r'(\w+)\s*\[\s*\]'
+
+        m = re.search(pattern, line_text)
+        if not m:
+            return ([], "Could not locate empty brackets `[]` on the "
+                        "violation line.")
+
+        # Replace the empty brackets with [SIZE]
+        bracket_start = line_text.index("[", m.start())
+        bracket_end = line_text.index("]", bracket_start) + 1
+        abs_start = start + bracket_start
+        abs_end = start + bracket_end
+
+        return ([{"start_byte": abs_start, "end_byte": abs_end,
+                  "text": f"[{array_size}]"}], "")
 
     def _generate_8_12_edits(self, findings: Dict,
                              violation: AxivionViolation
@@ -1389,6 +1495,35 @@ class FixEngine:
                 )
             return rule.fix_strategy
 
+        # ── Rule 8.2: Unnamed parameters in prototype ──
+        if rid == "MisraC2012-8.2":
+            cross = findings.get("cross_file", {})
+            def_params = cross.get("definition_params", [])
+            if def_params:
+                params_str = ", ".join(f"`{p}`" for p in def_params)
+                return (
+                    f"**Cross-file analysis**: definition parameters are "
+                    f"{params_str}.\n\n"
+                    f"Copy these parameter names into the declaration to "
+                    f"satisfy Rule 8.2."
+                )
+            return rule.fix_strategy
+
+        # ── Rule 8.11: Extern array size ──
+        if rid == "MisraC2012-8.11":
+            cross = findings.get("cross_file", {})
+            array_size = cross.get("array_size") if cross else None
+            if array_size:
+                def_file = cross.get("definition_file", "?")
+                def_line = cross.get("definition_line", "?")
+                return (
+                    f"**Cross-file analysis**: array definition found in "
+                    f"`{def_file}:{def_line}` with size `{array_size}`.\n\n"
+                    f"Update the extern declaration to include the explicit "
+                    f"size: `[{array_size}]`."
+                )
+            return rule.fix_strategy
+
         # ── Rule 8.3: Declaration mismatch ──
         if rid == "MisraC2012-8.3":
             cross = findings.get("cross_file", {})
@@ -1543,6 +1678,28 @@ class FixEngine:
         if rid == "MisraC2012-8.4" and findings.get("function"):
             cross = findings.get("cross_file", {})
             if cross and not cross.get("has_prior_declaration"):
+                return "HIGH"
+
+        # Rule 8.8: cross-file confirms safe to add static
+        if rid == "MisraC2012-8.8" and findings.get("safe_to_add_static"):
+            return "HIGH"
+
+        # Rule 8.3: cross-file found concrete mismatches (guidance is definitive)
+        if rid == "MisraC2012-8.3":
+            cross = findings.get("cross_file", {})
+            if cross and cross.get("mismatches"):
+                return "HIGH"
+
+        # Rule 8.11: cross-file resolved the array size from its definition
+        if rid == "MisraC2012-8.11":
+            cross = findings.get("cross_file", {})
+            if cross and cross.get("array_size") is not None:
+                return "HIGH"
+
+        # Rule 8.2: definition params available to copy to declaration
+        if rid == "MisraC2012-8.2":
+            cross = findings.get("cross_file", {})
+            if cross and cross.get("definition_params"):
                 return "HIGH"
 
         # 10.x with macro analysis is high confidence

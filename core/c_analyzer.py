@@ -880,6 +880,12 @@ class CAnalyzer:
                 if p.read_count == 0 and p.write_count == 0
             ]
 
+        elif rule_id == "MisraC2012-8.2":
+            # ── Cross-file: find definition param names for unnamed decl ──
+            sym = self._extract_symbol_name(file_path, line) if not fn else fn.name
+            if sym and self.index and self.index.is_built:
+                analysis["cross_file"] = self.index.check_rule_8_2(sym)
+
         elif rule_id == "MisraC2012-8.3" and fn:
             # ── Cross-file: compare header declaration with definition ──
             if self.index and self.index.is_built:
@@ -917,6 +923,12 @@ class CAnalyzer:
 
         elif rule_id == "MisraC2012-8.10" and fn:
             analysis["needs_static"] = fn.is_inline and not fn.is_static
+
+        elif rule_id == "MisraC2012-8.11":
+            # ── Cross-file: find array definition and extract size ──
+            sym = self._extract_symbol_name(file_path, line)
+            if sym and self.index and self.index.is_built:
+                analysis["cross_file"] = self.index.check_rule_8_11(sym)
 
         elif rule_id == "MisraC2012-8.12":
             enums = self.get_enum_values(file_path)

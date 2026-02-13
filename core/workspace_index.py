@@ -503,6 +503,25 @@ class WorkspaceIndex:
     #  Cross-file queries (used by CAnalyzer and FixEngine)
     # ────────────────────────────────────────────────────────────────
 
+    def check_rule_8_2(self, function_name: str) -> Dict:
+        """Rule 8.2: Find definition param names to copy to unnamed declaration."""
+        defs = self.symbols.find_definitions(function_name)
+        definition = defs[0] if defs else None
+
+        result: Dict = {
+            "function": function_name,
+            "definition_params": [],
+            "definition_file": None,
+            "definition_line": None,
+        }
+
+        if definition and definition.params:
+            result["definition_file"] = definition.file
+            result["definition_line"] = definition.line
+            result["definition_params"] = definition.params
+
+        return result
+
     def check_rule_8_3(self, function_name: str) -> Dict:
         """Rule 8.3: Compare header declaration with definition."""
         header_decl = self.symbols.find_header_declaration(function_name)
@@ -614,6 +633,52 @@ class WorkspaceIndex:
             "declared_in_header": header_decl.file if header_decl else None,
             "safe_to_add_static": len(ext_callers) == 0 and header_decl is None,
         }
+
+    def check_rule_8_11(self, symbol_name: str) -> Dict:
+        """Rule 8.11: Find array definition and extract its size.
+
+        For an `extern int arr[];` declaration, locates the definition
+        (e.g. `int arr[10] = {...}`) in another TU and extracts the
+        explicit array size so the extern declaration can be updated.
+        """
+        defs = self.symbols.find_definitions(symbol_name)
+        result: Dict = {
+            "symbol": symbol_name,
+            "array_size": None,
+            "definition_file": None,
+            "definition_line": None,
+            "definition_signature": None,
+        }
+
+        for defn in defs:
+            sig = defn.signature
+            # Match array size in definition: `type name[SIZE]` or `name[SIZE] = ...`
+            size_m = re.search(
+                r'\b' + re.escape(symbol_name) + r'\s*\[\s*(\d+|[A-Za-z_]\w*)\s*\]',
+                sig
+            )
+            if size_m:
+                result["array_size"] = size_m.group(1)
+                result["definition_file"] = defn.file
+                result["definition_line"] = defn.line
+                result["definition_signature"] = sig
+                break
+
+            # Also check for size derived from initializer list:
+            # `int arr[] = {1, 2, 3};` — count the elements
+            init_m = re.search(
+                r'\b' + re.escape(symbol_name) + r'\s*\[\s*\]\s*=\s*\{([^}]*)\}',
+                sig
+            )
+            if init_m:
+                elements = [e.strip() for e in init_m.group(1).split(",") if e.strip()]
+                result["array_size"] = str(len(elements))
+                result["definition_file"] = defn.file
+                result["definition_line"] = defn.line
+                result["definition_signature"] = sig
+                break
+
+        return result
 
     def check_rule_8_13(self, function_name: str) -> Dict:
         """Rule 8.13: Impact analysis for adding const to pointer param."""
