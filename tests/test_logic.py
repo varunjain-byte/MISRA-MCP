@@ -364,6 +364,134 @@ def test_10x_assignment_handling():
     print("  Compound RHS parenthesized ✓")
 
 
+def test_8_4_forward_declaration_autofix():
+    """Test Rule 8.4 auto-fix: same-file forward declaration insertion."""
+    section("8.4 FORWARD DECLARATION AUTO-FIX")
+
+    import tempfile
+    from core.axivion_parser import AxivionViolation
+
+    # ── Test 1: Basic case — external function with no prior declaration ──
+    c_code = b'#include <stdio.h>\n\nint compute(int x) {\n    return x * x;\n}\n'
+    with tempfile.NamedTemporaryFile(suffix='.c', delete=False, mode='wb') as f:
+        f.write(c_code)
+        tmp = f.name
+
+    try:
+        analyzer = CAnalyzer(os.path.dirname(tmp))
+        engine = FixEngine(analyzer)
+
+        # Simulate findings with function info and no prior declaration
+        fn = analyzer.get_function_at_line(tmp, 3)
+        assert fn is not None, "Should find function at line 3"
+        assert fn.name == "compute", f"Expected 'compute', got '{fn.name}'"
+
+        findings = {
+            "function": {
+                "name": fn.name,
+                "signature": fn.signature,
+                "start_line": fn.start_line,
+                "is_static": fn.is_static,
+            },
+            "cross_file": {
+                "has_prior_declaration": False,
+                "declarations": [],
+                "included_headers": [],
+            },
+        }
+
+        dummy_v = AxivionViolation(
+            rule_id="MisraC2012-8.4", message="No prior declaration",
+            file_path=tmp, line_number=3, severity="Required"
+        )
+        edits, skip = engine._generate_8_4_edits(findings, dummy_v)
+        assert len(edits) == 1, f"Expected 1 edit, got {len(edits)}: {skip}"
+        assert edits[0]["text"].strip().endswith(";"), \
+            f"Prototype should end with ';': {edits[0]['text']}"
+        assert "compute" in edits[0]["text"], \
+            f"Prototype should contain function name: {edits[0]['text']}"
+        # Verify it's an insertion (start == end) at the right spot
+        assert edits[0]["start_byte"] == edits[0]["end_byte"], \
+            "Should be a pure insertion (start_byte == end_byte)"
+        print(f"  Basic forward declaration generated: {edits[0]['text'].strip()} ✓")
+
+        # Verify the edit produces valid C when applied
+        patched = (c_code[:edits[0]["start_byte"]]
+                   + edits[0]["text"].encode()
+                   + c_code[edits[0]["end_byte"]:])
+        assert b"compute" in patched
+        # The prototype should appear before the definition
+        proto_pos = patched.index(b"int compute(int x);")
+        defn_pos = patched.index(b"int compute(int x) {")
+        assert proto_pos < defn_pos, "Prototype must appear before definition"
+        print("  Patched source has prototype before definition ✓")
+
+    finally:
+        os.unlink(tmp)
+
+    # ── Test 2: Static function — should be skipped ──
+    c_code_static = b'static int helper(int x) {\n    return x + 1;\n}\n'
+    with tempfile.NamedTemporaryFile(suffix='.c', delete=False, mode='wb') as f:
+        f.write(c_code_static)
+        tmp2 = f.name
+
+    try:
+        analyzer2 = CAnalyzer(os.path.dirname(tmp2))
+        fn2 = analyzer2.get_function_at_line(tmp2, 1)
+        assert fn2 is not None
+        findings_static = {
+            "function": {
+                "name": fn2.name,
+                "signature": fn2.signature,
+                "start_line": fn2.start_line,
+                "is_static": True,
+            },
+            "cross_file": {
+                "has_prior_declaration": False,
+                "declarations": [],
+            },
+        }
+        dummy_v2 = AxivionViolation(
+            rule_id="MisraC2012-8.4", message="test",
+            file_path=tmp2, line_number=1, severity="Required"
+        )
+        engine2 = FixEngine(analyzer2)
+        edits, skip = engine2._generate_8_4_edits(findings_static, dummy_v2)
+        assert len(edits) == 0, "Static functions should not get forward declarations"
+        assert "static" in skip.lower(), f"Skip reason should mention static: {skip}"
+        print("  Static function correctly skipped ✓")
+    finally:
+        os.unlink(tmp2)
+
+    # ── Test 3: Already has prior declaration — should be skipped ──
+    findings_has_decl = {
+        "function": {
+            "name": "foo",
+            "signature": "int foo(void)",
+            "start_line": 5,
+            "is_static": False,
+        },
+        "cross_file": {
+            "has_prior_declaration": True,
+            "declarations": [{"file": "foo.h", "line": 3, "signature": "int foo(void)"}],
+        },
+    }
+    dummy_v3 = AxivionViolation(
+        rule_id="MisraC2012-8.4", message="test",
+        file_path="nonexistent.c", line_number=5, severity="Required"
+    )
+    fixer = FixEngine()
+    edits, skip = fixer._generate_8_4_edits(findings_has_decl, dummy_v3)
+    assert len(edits) == 0, "Should skip when prior declaration exists"
+    assert "already exists" in skip.lower(), f"Skip reason: {skip}"
+    print("  Already-declared function correctly skipped ✓")
+
+    # ── Test 4: No function context — should skip gracefully ──
+    edits, skip = fixer._generate_8_4_edits({}, dummy_v3)
+    assert len(edits) == 0, "Should skip when no function context"
+    print("  No function context handled gracefully ✓")
+
+
 def run_tests():
     print("=" * 72)
     print("  COMPREHENSIVE MISRA AGENT TEST SUITE (AST-aware)")
@@ -398,13 +526,16 @@ def run_tests():
     # 8. 10.x ASSIGNMENT HANDLING
     test_10x_assignment_handling()
 
+    # 9. Rule 8.4 FORWARD DECLARATION AUTO-FIX
+    test_8_4_forward_declaration_autofix()
+
     print("\n" + "=" * 72)
     print("  ALL TESTS PASSED ✓")
     print(f"  • {len(all_violations)} violations parsed")
     print(f"  • Knowledge base verified (160+ rules)")
     print(f"  • AST analysis verified")
     print(f"  • Fix Engine confidence: {confidence_dist}")
-    print(f"  • Automated fixes verified for 2.x, 8.x, 10.x, 11.x, 14.x, 15.x")
+    print(f"  • Automated fixes verified for 2.x, 8.x (incl. 8.4), 10.x, 11.x, 14.x, 15.x")
     print("=" * 72)
 
 

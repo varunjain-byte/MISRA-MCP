@@ -369,10 +369,7 @@ class FixEngine:
                         "cross-file analysis to identify which declaration is "
                         "canonical. Changing the wrong one breaks the API.")
         if rid == "MisraC2012-8.4":
-            return ([], "Rule 8.4 (visible prior declaration) requires "
-                        "adding a prototype in a header file. The choice of "
-                        "which header to modify depends on the project's "
-                        "include structure.")
+            return self._generate_8_4_edits(findings, violation)
         if rid == "MisraC2012-8.5":
             return ([], "Rule 8.5 (external declaration in one file) "
                         "requires moving declarations between files. "
@@ -712,6 +709,60 @@ class FixEngine:
         return ([], "Could not find empty parameter list `()` on the "
                     "violation line. The function may already have "
                     "parameters, or the signature may span multiple lines.")
+
+    def _generate_8_4_edits(self, findings: Dict,
+                            violation: AxivionViolation
+                            ) -> "tuple[List[Dict], str]":
+        """Rule 8.4: Insert a same-file forward declaration above the function.
+
+        Inserts `<signature>;` on a new line immediately before the function
+        definition.  This satisfies Rule 8.4 (a compatible declaration is
+        visible at the point of definition) without touching any other file.
+
+        Safety:
+          - Skips static functions (they don't need external declarations).
+          - Skips if cross-file analysis already found a prior declaration.
+          - The prototype is extracted verbatim from the definition's AST
+            signature, so names and types match exactly (no 8.3 risk).
+          - Duplicate compatible declarations are legal in C (no build error).
+        """
+        fn_info = findings.get("function", {})
+        if not fn_info:
+            return ([], "No function context available at the violation "
+                        "line. Cannot generate forward declaration.")
+
+        # Static functions have internal linkage — 8.4 doesn't apply
+        if fn_info.get("is_static"):
+            return ([], "Function is static (internal linkage). "
+                        "Rule 8.4 only applies to external-linkage symbols.")
+
+        # If cross-file already found a prior declaration, nothing to do
+        cross = findings.get("cross_file", {})
+        if cross.get("has_prior_declaration"):
+            return ([], "A prior compatible declaration already exists. "
+                        "No fix needed.")
+
+        signature = fn_info.get("signature", "")
+        if not signature:
+            return ([], "Could not extract function signature from AST.")
+
+        # Clean the signature: strip storage-class specifiers that should
+        # not appear on a bare forward declaration (e.g. 'extern' is fine
+        # but is already implicit; 'inline' should be kept).
+        proto = signature.rstrip() + ";\n"
+
+        source = self._get_source_bytes(violation.file_path)
+        if source is None:
+            return self._NO_ANALYZER
+
+        # Insert the prototype right before the function definition line
+        target_line = fn_info.get("start_line", violation.line_number)
+        insert_at, _ = self._line_byte_range(source, target_line)
+        if insert_at is None:
+            return ([], "Could not resolve function definition line in source.")
+
+        return ([{"start_byte": insert_at, "end_byte": insert_at,
+                  "text": proto}], "")
 
     def _generate_8_8_edits(self, findings: Dict,
                             violation: AxivionViolation
@@ -1489,7 +1540,11 @@ class FixEngine:
             return "HIGH"
         if rid == "MisraC2012-8.12" and findings.get("enum_collisions"):
             return "HIGH"
-            
+        if rid == "MisraC2012-8.4" and findings.get("function"):
+            cross = findings.get("cross_file", {})
+            if cross and not cross.get("has_prior_declaration"):
+                return "HIGH"
+
         # 10.x with macro analysis is high confidence
         if rid.startswith("MisraC2012-10.") and findings.get("macro_analysis"):
             return "HIGH"
