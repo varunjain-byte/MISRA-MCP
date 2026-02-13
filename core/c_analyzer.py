@@ -362,7 +362,11 @@ class CAnalyzer:
     # ────────────────────────────────────────────────────────────────
 
     def _analyze_param_usage(self, params: List[ParamInfo], body: Node, source: bytes):
-        """Count read/write references to each parameter within the function body."""
+        """Count read/write references to each parameter within the function body.
+
+        Also detects when a pointer parameter is passed as a non-const argument
+        to another function (indirect write potential).
+        """
         param_names = {p.name for p in params}
         param_map = {p.name: p for p in params}
 
@@ -377,6 +381,11 @@ class CAnalyzer:
             p = param_map[name]
 
             if self._is_write_context(node):
+                p.write_count += 1
+                p.write_lines.append(line)
+            elif p.is_pointer and self._is_passed_as_nonconst_arg(node, source):
+                # Pointer passed to a function that takes non-const param —
+                # treat as potential write (conservative)
                 p.write_count += 1
                 p.write_lines.append(line)
             else:
@@ -423,6 +432,97 @@ class CAnalyzer:
             return True
 
         return False
+
+    def _is_passed_as_nonconst_arg(self, node: Node, source: bytes) -> bool:
+        """Check if a pointer identifier is passed as an argument to a function call.
+
+        If the callee's corresponding parameter is not const-qualified, the
+        pointer may be written through — so we conservatively treat it as a
+        write.  If we cannot determine the callee's parameter types, we
+        assume the worst (non-const).
+        """
+        # Walk up to find if this identifier is inside a call_expression's
+        # argument_list
+        arg_list = None
+        current = node.parent
+        depth = 0
+        while current and depth < 8:
+            if current.type == "argument_list":
+                arg_list = current
+                break
+            # Stop if we've left the immediate expression context
+            if current.type in ("compound_statement", "function_definition",
+                                "declaration"):
+                return False
+            current = current.parent
+            depth += 1
+
+        if arg_list is None:
+            return False
+
+        # The call_expression is arg_list's parent
+        call_expr = arg_list.parent
+        if call_expr is None or call_expr.type != "call_expression":
+            return False
+
+        # Determine which argument position this identifier is in
+        arg_index = -1
+        for i, child in enumerate(arg_list.children):
+            if child.type in (",", "(", ")"):
+                continue
+            if self._node_contains(child, node):
+                arg_index = i // 1  # approximate
+                break
+
+        # Try to find the callee's declaration to check if the param is const
+        callee_node = call_expr.children[0] if call_expr.children else None
+        if callee_node is None:
+            return True  # Cannot determine callee — assume non-const
+
+        callee_name = self._node_text(callee_node, source)
+
+        # Well-known safe (const) functions — common C standard library
+        _CONST_SAFE_FUNCS = {
+            "printf", "fprintf", "sprintf", "snprintf", "puts", "fputs",
+            "strlen", "strcmp", "strncmp", "memcmp", "strchr", "strstr",
+            "fwrite", "fread", "sizeof", "assert", "free",
+        }
+        if callee_name in _CONST_SAFE_FUNCS:
+            return False
+
+        # Look up the callee in the current TU to check param types
+        root = node
+        while root.parent:
+            root = root.parent
+        callee_fn = self._find_function_node(root, callee_name, source)
+        if callee_fn:
+            decl = self._find_child(callee_fn, "function_declarator")
+            if decl:
+                param_list = self._find_child(decl, "parameter_list")
+                if param_list:
+                    params = [c for c in param_list.children
+                              if c.type == "parameter_declaration"]
+                    # Find the arg_index-th parameter, check for const
+                    actual_idx = 0
+                    for child in arg_list.children:
+                        if child.type in (",", "(", ")"):
+                            continue
+                        if self._node_contains(child, node):
+                            break
+                        actual_idx += 1
+                    if actual_idx < len(params):
+                        param_text = self._node_text(params[actual_idx], source)
+                        if "const" in param_text:
+                            return False  # Callee takes const — safe
+
+        # Default conservative: treat as potential write
+        return True
+
+    @staticmethod
+    def _node_contains(ancestor: Node, descendant: Node) -> bool:
+        """Check if ancestor contains descendant by byte range."""
+        return (ancestor.start_byte <= descendant.start_byte and
+                ancestor.end_byte >= descendant.end_byte)
 
     # ────────────────────────────────────────────────────────────────
     #  Reachability analysis
@@ -473,6 +573,64 @@ class CAnalyzer:
             # Recurse into compound statements but not into sub-scopes like if/for
             if child.type == "compound_statement":
                 result = self._check_reachability(child, target_line, source)
+                if result:
+                    return result
+
+        return None
+
+    def _get_unreachable_range(self, file_path: str, flagged_line: int,
+                               fn: 'FunctionInfo') -> Optional[Dict]:
+        """Find all unreachable siblings after the terminal statement.
+
+        Returns {"start_line": int, "end_line": int} covering the full
+        unreachable block, so the fixer can remove it in one pass.
+        """
+        source, tree = self._get_tree(file_path)
+        if tree is None:
+            return None
+
+        fn_node = self._find_function_node(tree.root_node, fn.name, source)
+        if fn_node is None:
+            return None
+
+        body = self._find_child(fn_node, "compound_statement")
+        if body is None:
+            return None
+
+        return self._find_unreachable_range(body, flagged_line, source)
+
+    def _find_unreachable_range(self, block: Node, flagged_line: int,
+                                source: bytes) -> Optional[Dict]:
+        """Recursively find the range of unreachable siblings in a block."""
+        terminal_types = {"return_statement", "break_statement",
+                          "continue_statement", "goto_statement"}
+
+        for i, child in enumerate(block.children):
+            child_end_line = child.end_point[0] + 1
+
+            if child.type in terminal_types and child_end_line < flagged_line:
+                remaining = block.children[i + 1:]
+                # Check if flagged_line falls within remaining siblings
+                for sibling in remaining:
+                    sib_start = sibling.start_point[0] + 1
+                    sib_end = sibling.end_point[0] + 1
+                    if sib_start <= flagged_line <= sib_end:
+                        # Found: collect ALL unreachable siblings after terminal
+                        first_unreachable = remaining[0].start_point[0] + 1
+                        last_unreachable = remaining[-1].end_point[0] + 1
+                        # Don't include the closing brace of the block
+                        for r in reversed(remaining):
+                            if r.type == "}":
+                                continue
+                            last_unreachable = r.end_point[0] + 1
+                            break
+                        return {
+                            "start_line": first_unreachable,
+                            "end_line": last_unreachable,
+                        }
+
+            if child.type == "compound_statement":
+                result = self._find_unreachable_range(child, flagged_line, source)
                 if result:
                     return result
 
@@ -693,7 +851,7 @@ class CAnalyzer:
 
         if rule_id == "MisraC2012-2.1":
             reason = self.is_unreachable(file_path, line)
-            
+
             # Additional preprocessor check: is the line inside an inactive block?
             # e.g. #if 0 ... #endif
             if self.preprocessor:
@@ -706,8 +864,15 @@ class CAnalyzer:
                         break
                 if not is_active:
                     reason = "Code is inside an inactive preprocessor block (e.g. #if 0)"
-            
+
             analysis["unreachable_reason"] = reason
+
+            # Compute the full unreachable range so the fixer can remove
+            # the entire block, not just the single flagged line
+            if reason and fn:
+                unreachable_range = self._get_unreachable_range(file_path, line, fn)
+                if unreachable_range:
+                    analysis["unreachable_range"] = unreachable_range
 
         elif rule_id == "MisraC2012-2.7" and fn:
             analysis["unused_params"] = [
@@ -764,13 +929,19 @@ class CAnalyzer:
 
         elif rule_id == "MisraC2012-8.13" and fn:
             # Single-file: which pointer params are never written through?
+            # Also checks:
+            #   - Already const → skip (not a candidate)
+            #   - Passed as non-const arg to another function → counted as write
             analysis["const_candidates"] = [
                 {
                     "name": p.name,
                     "type": p.type_str,
                     "reads": p.read_count,
                     "writes": p.write_count,
-                    "safe_to_add_const": p.is_pointer and p.write_count == 0,
+                    "already_const": "const" in p.type_str,
+                    "safe_to_add_const": (p.is_pointer
+                                          and p.write_count == 0
+                                          and "const" not in p.type_str),
                 }
                 for p in fn.params
                 if p.is_pointer
@@ -868,11 +1039,17 @@ class CAnalyzer:
                                 is_safe = True # simplify
                             
                             if not is_safe:
+                                # Determine if the expression is a pointer
+                                # (helps the fixer choose != NULL vs != 0)
+                                expr_type = self.get_expression_type(inner, source)
+                                is_ptr = (expr_type.is_pointer
+                                          if expr_type else False)
                                 non_bools.append({
                                     "line": inner.start_point[0] + 1,
                                     "start_byte": inner.start_byte,
                                     "end_byte": inner.end_byte,
-                                    "text": self._node_text(inner, source)
+                                    "text": self._node_text(inner, source),
+                                    "is_pointer": is_ptr,
                                 })
             if non_bools:
                 analysis["non_boolean_conditions"] = non_bools
@@ -1082,8 +1259,8 @@ class CAnalyzer:
             # If multi-line, we might include them if they start or end on this line?
             # Let's restrict to nodes identified as expressions on this line.
             if start_line <= line <= end_line:
-                if node.type in ("binary_expression", "assignment_expression", "cast_expression"):
-                    print(f"DEBUG: Found {node.type} at {start_line}-{end_line}")
+                if node.type in ("binary_expression", "assignment_expression", "cast_expression", "init_declarator"):
+                    logger.debug("Found %s at %d-%d", node.type, start_line, end_line)
                     # Avoid duplicates (tree walk visits same node once, but avoid logic errors)
                     if node.id in seen:
                         continue
@@ -1147,14 +1324,84 @@ class CAnalyzer:
              t_op = self.get_expression_type(val_node, source)
              info["operands"] = [
                  {
-                     "text": info["operand"], 
-                     "start_byte": val_node.start_byte, 
+                     "text": info["operand"],
+                     "start_byte": val_node.start_byte,
                      "end_byte": val_node.end_byte,
                      "type": t_op.__dict__ if t_op else None
                  }
              ]
 
+        # Assignment expression: lhs = rhs
+        elif node.type == "assignment_expression":
+            operator = None
+            for child in node.children:
+                if child.type in ("=", "+=", "-=", "*=", "/=", "%=",
+                                  "<<=", ">>=", "&=", "^=", "|="):
+                    operator = child.text.decode() if hasattr(child.text, 'decode') else str(child.text)
+                    break
+            # Skip compound assignments — too complex to cast safely
+            if operator and operator != "=":
+                return info
+            lhs = node.child_by_field_name("left")
+            rhs = node.child_by_field_name("right")
+            if lhs and rhs:
+                info["operator"] = "="
+                lhs_type = self._resolve_identifier_type(lhs, source)
+                rhs_type = self.get_expression_type(rhs, source)
+                info["operands"] = [
+                    {
+                        "text": self._node_text(rhs, source),
+                        "start_byte": rhs.start_byte,
+                        "end_byte": rhs.end_byte,
+                        "type": rhs_type.__dict__ if rhs_type else None,
+                        "target_type": lhs_type.__dict__ if lhs_type else None,
+                    }
+                ]
+
+        # Init declarator: type x = expr;
+        elif node.type == "init_declarator":
+            value = node.child_by_field_name("value")
+            if value:
+                decl_type = self._extract_init_declarator_type(node, source)
+                val_type = self.get_expression_type(value, source)
+                info["operator"] = "="
+                info["operands"] = [
+                    {
+                        "text": self._node_text(value, source),
+                        "start_byte": value.start_byte,
+                        "end_byte": value.end_byte,
+                        "type": val_type.__dict__ if val_type else None,
+                        "target_type": decl_type.__dict__ if decl_type else None,
+                    }
+                ]
+
         return info
+
+    def _extract_init_declarator_type(self, init_decl_node: Node, source: bytes) -> Optional["CType"]:
+        """Walk up to parent 'declaration' node and extract the type specifier.
+
+        For ``uint8_t x = expr;`` the tree-sitter AST looks like:
+            declaration
+              type_identifier "uint8_t"
+              init_declarator
+                identifier "x"
+                = "="
+                <value>
+        We collect all type-related children before the first init_declarator.
+        """
+        parent = init_decl_node.parent
+        if parent and parent.type == "declaration":
+            type_parts: list[str] = []
+            for child in parent.children:
+                if child.type in ("type_identifier", "primitive_type",
+                                  "sized_type_specifier", "type_qualifier"):
+                    type_parts.append(self._node_text(child, source))
+                elif child.type == "init_declarator":
+                    break  # stop before declarator
+            if type_parts:
+                type_name = " ".join(type_parts)
+                return self.type_system.get_type(type_name)
+        return None
 
     # ────────────────────────────────────────────────────────────────
     #  Type Inference
@@ -1293,13 +1540,6 @@ class CAnalyzer:
              return self.type_system.get_type(type_str)
              
         return None
-        """Extract the primary identifier from a line of code."""
-        lines = self._source_lines(file_path)
-        if line > len(lines):
-            return None
-        line_text = lines[line - 1]
-        m = re.search(r'\b(\w+)\s*[(\[;]', line_text)
-        return m.group(1) if m else None
 
     # ────────────────────────────────────────────────────────────────
     #  Tree traversal helpers

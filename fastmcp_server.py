@@ -342,6 +342,11 @@ def apply_fix(rule_id: str, file_path: str, line_number: int) -> str:
     - Rule 2.x (Unused Code): Deletes dead/unreachable code, inserts (void)param.
     - Rule 8.x (Declarations): Adds static/const, removes restrict.
     - Rule 10.x (Essential Types): Inserts casts.
+    - Rule 11.9 (NULL), 14.4 (Boolean), 15.6 (Braces).
+
+    After applying edits:
+      - Validates the result is parseable C (tree-sitter re-parse)
+      - Invalidates the AST cache so subsequent calls use fresh data
 
     Args:
         rule_id:     The MISRA rule ID.
@@ -363,9 +368,8 @@ def apply_fix(rule_id: str, file_path: str, line_number: int) -> str:
     # Analyze to get edits
     context = context_provider.get_code_context(file_path, line_number)
     viol_line = context_provider.get_line(file_path, line_number)
-    # No need for full dependency analysis for apply, just the fix
     analysis = fix_engine.propose_fix(target, context, viol_line, None)
-    
+
     if not analysis.edits:
         reason = analysis.edit_skip_reason or "No specific reason available."
         return (f"Auto-fix not available.\n\n"
@@ -376,30 +380,71 @@ def apply_fix(rule_id: str, file_path: str, line_number: int) -> str:
     try:
         abs_path = os.path.join(context_provider.workspace_root, file_path)
         with open(abs_path, "rb") as f:
-            content = bytearray(f.read())
-        
+            original = f.read()
+        content = bytearray(original)
+
         # Sort edits by start_byte descending to keep offsets valid
         sorted_edits = sorted(analysis.edits, key=lambda e: e["start_byte"], reverse=True)
-        
+
+        # Overlap detection: ensure no edit overlaps with a later one
         applied_count = 0
+        skipped_count = 0
+        last_start = float('inf')
         for edit in sorted_edits:
             start = edit["start_byte"]
             end = edit["end_byte"]
             text = edit["text"].encode("utf-8")
-            
+
             # Bounds check
             if start < 0 or end > len(content) or start > end:
+                skipped_count += 1
                 continue
-                
-            # Replace [start:end] with text
+
+            # Overlap check: this edit's end must not exceed the start
+            # of the previous (lower-offset) edit we already applied
+            if end > last_start:
+                skipped_count += 1
+                continue
+
             content[start:end] = text
+            last_start = start
             applied_count += 1
-            
+
+        if applied_count == 0:
+            return "Error: All edits were skipped (out of bounds or overlapping)."
+
+        # ── Verify: re-parse with tree-sitter to check valid C ──
+        from tree_sitter import Parser
+        from core.c_analyzer import C_LANGUAGE
+        verify_parser = Parser(C_LANGUAGE)
+        verify_tree = verify_parser.parse(bytes(content))
+        if verify_tree.root_node.has_error:
+            # Rollback: restore original content
+            with open(abs_path, "wb") as f:
+                f.write(original)
+            return ("Error: Fix produced invalid C (parse errors detected). "
+                    "Rolled back to original. The fix may need manual "
+                    "adjustment.\n\n"
+                    f"**Guidance:**\n{analysis.fix_guidance}")
+
+        # Write the validated content
         with open(abs_path, "wb") as f:
             f.write(content)
-            
-        return f"Successfully applied {applied_count} edit(s) to '{file_path}'."
-        
+
+        # ── Invalidate caches so subsequent calls use fresh data ──
+        if analyzer:
+            resolved = analyzer._resolve(file_path)
+            analyzer._cache.pop(resolved, None)
+
+        result = f"Successfully applied {applied_count} edit(s) to '{file_path}'."
+        if skipped_count > 0:
+            result += f" ({skipped_count} edit(s) skipped due to overlap/bounds.)"
+        if analysis.side_effects:
+            result += "\n\n**Side effects to review:**\n"
+            for se in analysis.side_effects:
+                result += f"- {se}\n"
+        return result
+
     except Exception as e:
         return f"Error applying fix: {e}"
 
