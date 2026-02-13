@@ -41,6 +41,101 @@ fix_engine = None
 workspace_index = None
 preprocessor = None
 
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Violation Lookup Helper
+# ═══════════════════════════════════════════════════════════════════════
+
+def _find_violation(rule_id: str, file_path: str, line_number: int):
+    """Find a violation with progressive fallback.
+
+    Returns (violation, error_message).  Exactly one is non-None.
+
+    Strategy:
+      1. Exact match: rule + file + line
+      2. Relaxed line: rule + file (any line) — handles off-by-one
+      3. Basename match: rule + same filename in a different path
+      4. Global search: find ALL locations for this rule across the report
+    """
+    # Normalise for display
+    norm_path = file_path.replace("\\", "/")
+
+    # 1. Exact match
+    violations = parser.get_violations_by_file(file_path)
+    target = next(
+        (v for v in violations if v.rule_id == rule_id and v.line_number == line_number),
+        None,
+    )
+    if target:
+        return target, None
+
+    # 2. Same file, different line
+    same_file = [v for v in violations if v.rule_id == rule_id]
+    if same_file:
+        lines = sorted({v.line_number for v in same_file})
+        lines_str = ", ".join(str(ln) for ln in lines[:10])
+        closest = min(same_file, key=lambda v: abs(v.line_number - line_number))
+        hint = (
+            f"No `{rule_id}` violation at line {line_number} in `{norm_path}`, "
+            f"but found {len(same_file)} violation(s) for this rule at line(s): {lines_str}.\n"
+            f"**Closest match:** line {closest.line_number} — using that instead."
+        )
+        return closest, hint
+
+    # 3. Basename match — violation may be in a .c file, not the .h the LLM passed
+    basename = os.path.basename(norm_path)
+    all_violations = parser.get_all_violations()
+    basename_matches = [
+        v for v in all_violations
+        if v.rule_id == rule_id
+        and os.path.basename(v.file_path.replace("\\", "/")) == basename
+    ]
+    if basename_matches:
+        v = basename_matches[0]
+        hint = (
+            f"No `{rule_id}` violation in `{norm_path}`, "
+            f"but found it in `{v.file_path}:{v.line_number}` (same basename).\n"
+            f"**Using that match instead.**"
+        )
+        return v, hint
+
+    # 4. Global search — find where this rule IS reported
+    global_matches = [v for v in all_violations if v.rule_id == rule_id]
+    if global_matches:
+        # Group by file for a readable summary
+        by_file = {}
+        for v in global_matches:
+            fp = v.file_path.replace("\\", "/")
+            by_file.setdefault(fp, []).append(v.line_number)
+
+        locations = []
+        for fp, lines in sorted(by_file.items())[:8]:
+            lines_str = ", ".join(str(ln) for ln in sorted(lines)[:5])
+            if len(lines) > 5:
+                lines_str += f" ... ({len(lines)} total)"
+            locations.append(f"  - `{fp}`: line(s) {lines_str}")
+
+        loc_block = "\n".join(locations)
+        extra = ""
+        if len(by_file) > 8:
+            extra = f"\n  ... and {len(by_file) - 8} more file(s)"
+
+        msg = (
+            f"No `{rule_id}` violation found in `{norm_path}`.\n\n"
+            f"**`{rule_id}` violations exist in these files:**\n{loc_block}{extra}\n\n"
+            f"Please call `propose_fix` or `apply_fix` with the correct file path and line number."
+        )
+        return None, msg
+
+    # 5. Rule not in report at all
+    available_rules = sorted({v.rule_id for v in violations})
+    msg = f"No `{rule_id}` violation found in `{norm_path}`."
+    if available_rules:
+        msg += f"\nAvailable rules in this file: {', '.join(available_rules)}"
+    else:
+        msg += "\nNo violations found in this file. Check the path or run `list_violations`."
+    return None, msg
+
 # ═══════════════════════════════════════════════════════════════════════
 #  Tool 1 — Load Report
 # ═══════════════════════════════════════════════════════════════════════
@@ -240,28 +335,25 @@ def propose_fix(rule_id: str, file_path: str, line_number: int) -> str:
     if parser is None or context_provider is None:
         return "Error: Not initialised. Call load_report first."
 
-    # Find the matching violation
-    violations = parser.get_violations_by_file(file_path)
-    target = next(
-        (v for v in violations if v.rule_id == rule_id and v.line_number == line_number),
-        None,
-    )
-    if not target:
-        available_rules = sorted({v.rule_id for v in violations})
-        msg = f"Violation '{rule_id}' not found in '{file_path}'."
-        if available_rules:
-            msg += f"\nAvailable rules in this file: {', '.join(available_rules)}"
-        else:
-            msg += "\nNo violations found in this file. Check the path or run list_violations."
-        return msg
+    # Find the matching violation (with progressive fallback)
+    target, lookup_msg = _find_violation(rule_id, file_path, line_number)
+    if target is None:
+        return lookup_msg
 
-    # Gather context
-    context = context_provider.get_code_context(file_path, line_number)
-    viol_line = context_provider.get_line(file_path, line_number)
-    deps = context_provider.analyze_dependencies(file_path)
+    # Gather context using the actual violation location
+    actual_file = target.file_path
+    actual_line = target.line_number
+    context = context_provider.get_code_context(actual_file, actual_line)
+    viol_line = context_provider.get_line(actual_file, actual_line)
+    deps = context_provider.analyze_dependencies(actual_file)
 
     analysis = fix_engine.propose_fix(target, context, viol_line, deps)
-    return analysis.to_markdown()
+    result = analysis.to_markdown()
+
+    # Prepend fallback hint if we resolved to a different location
+    if lookup_msg:
+        result = f"> **Note:** {lookup_msg}\n\n{result}"
+    return result
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -356,29 +448,30 @@ def apply_fix(rule_id: str, file_path: str, line_number: int) -> str:
     if parser is None or context_provider is None:
         return "Error: Not initialised. Call load_report first."
 
-    # Find the matching violation
-    violations = parser.get_violations_by_file(file_path)
-    target = next(
-        (v for v in violations if v.rule_id == rule_id and v.line_number == line_number),
-        None,
-    )
-    if not target:
-        return f"Error: Violation '{rule_id}' not found at {file_path}:{line_number}"
+    # Find the matching violation (with progressive fallback)
+    target, lookup_msg = _find_violation(rule_id, file_path, line_number)
+    if target is None:
+        return lookup_msg
+
+    # Use the actual violation location (may differ from what was passed)
+    actual_file = target.file_path
+    actual_line = target.line_number
 
     # Analyze to get edits
-    context = context_provider.get_code_context(file_path, line_number)
-    viol_line = context_provider.get_line(file_path, line_number)
+    context = context_provider.get_code_context(actual_file, actual_line)
+    viol_line = context_provider.get_line(actual_file, actual_line)
     analysis = fix_engine.propose_fix(target, context, viol_line, None)
 
     if not analysis.edits:
         reason = analysis.edit_skip_reason or "No specific reason available."
-        return (f"Auto-fix not available.\n\n"
+        prefix = f"> **Note:** {lookup_msg}\n\n" if lookup_msg else ""
+        return (f"{prefix}Auto-fix not available.\n\n"
                 f"**Reason:** {reason}\n\n"
                 f"**Guidance:**\n{analysis.fix_guidance}")
 
     # Apply edits
     try:
-        abs_path = os.path.join(context_provider.workspace_root, file_path)
+        abs_path = os.path.join(context_provider.workspace_root, actual_file)
         with open(abs_path, "rb") as f:
             original = f.read()
         content = bytearray(original)
@@ -433,10 +526,12 @@ def apply_fix(rule_id: str, file_path: str, line_number: int) -> str:
 
         # ── Invalidate caches so subsequent calls use fresh data ──
         if analyzer:
-            resolved = analyzer._resolve(file_path)
+            resolved = analyzer._resolve(actual_file)
             analyzer._cache.pop(resolved, None)
 
-        result = f"Successfully applied {applied_count} edit(s) to '{file_path}'."
+        result = f"Successfully applied {applied_count} edit(s) to `{actual_file}`."
+        if lookup_msg:
+            result = f"> **Note:** {lookup_msg}\n\n{result}"
         if skipped_count > 0:
             result += f" ({skipped_count} edit(s) skipped due to overlap/bounds.)"
         if analysis.side_effects:
