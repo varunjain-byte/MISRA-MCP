@@ -1298,12 +1298,19 @@ class FixEngine:
             if "*" in target_name or "*" in (op.get("type") or {}).get("name", ""):
                 continue
             # Skip if source and target are same essential type category
+            # AND no narrowing — Rule 10.3 requires explicit casts even
+            # within the same category when the target is narrower
+            # (e.g. uint32_t → uint8_t are both Unsigned but truncate).
             src_type = op.get("type")
             if src_type:
                 src_cat = get_category(src_type)
                 tgt_cat = get_category(target)
                 if src_cat == tgt_cat:
-                    continue
+                    src_width = src_type.get("width", 0)
+                    tgt_width = target.get("width", 0)
+                    if tgt_width == 0 or src_width <= tgt_width:
+                        continue  # widening or same width — no cast needed
+                    # else: narrowing within same category — fall through
             text = op.get("text", "")
             if _is_compound(text):
                 cast_expr = f"({target_name})({text})"

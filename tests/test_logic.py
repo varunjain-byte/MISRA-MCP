@@ -363,6 +363,73 @@ def test_10x_assignment_handling():
     assert edits[0]["text"] == "(uint8_t)(a + b)", f"Expected '(uint8_t)(a + b)', got '{edits[0]['text']}'"
     print("  Compound RHS parenthesized ✓")
 
+    # ── Test 7: Same-category narrowing generates cast (Rule 10.3) ──
+    # uint32_t → uint8_t: both Unsigned, but target is narrower → needs cast
+    findings_same_cat_narrow = {
+        "expressions": [
+            {
+                "type": "assignment_expression",
+                "operands": [
+                    {
+                        "text": "wide_val",
+                        "start_byte": 60,
+                        "end_byte": 68,
+                        "type": {"name": "uint32_t", "width": 32, "is_signed": False, "is_float": False, "is_pointer": False},
+                        "target_type": {"name": "uint8_t", "width": 8, "is_signed": False, "is_float": False, "is_pointer": False},
+                    }
+                ]
+            }
+        ]
+    }
+    edits, skip = fixer._generate_10_x_edits(findings_same_cat_narrow, dummy_v)
+    assert len(edits) == 1, f"Same-category narrowing: expected 1 edit, got {len(edits)}"
+    assert edits[0]["text"] == "(uint8_t)wide_val", f"Expected '(uint8_t)wide_val', got '{edits[0]['text']}'"
+    print("  Same-category narrowing cast (uint32→uint8) ✓")
+
+    # ── Test 8: Same-category widening is still skipped ──
+    # uint8_t → uint32_t: both Unsigned, target is wider → no cast needed
+    findings_same_cat_widen = {
+        "expressions": [
+            {
+                "type": "assignment_expression",
+                "operands": [
+                    {
+                        "text": "narrow_val",
+                        "start_byte": 70,
+                        "end_byte": 80,
+                        "type": {"name": "uint8_t", "width": 8, "is_signed": False, "is_float": False, "is_pointer": False},
+                        "target_type": {"name": "uint32_t", "width": 32, "is_signed": False, "is_float": False, "is_pointer": False},
+                    }
+                ]
+            }
+        ]
+    }
+    edits, skip = fixer._generate_10_x_edits(findings_same_cat_widen, dummy_v)
+    assert len(edits) == 0, f"Same-category widening should produce no edits, got {len(edits)}"
+    print("  Same-category widening correctly skipped (uint8→uint32) ✓")
+
+    # ── Test 9: Same-category, same-width is skipped ──
+    # unsigned int → unsigned int: no narrowing → no cast
+    findings_same_cat_same_width = {
+        "expressions": [
+            {
+                "type": "assignment_expression",
+                "operands": [
+                    {
+                        "text": "x",
+                        "start_byte": 90,
+                        "end_byte": 91,
+                        "type": {"name": "unsigned int", "width": 32, "is_signed": False, "is_float": False, "is_pointer": False},
+                        "target_type": {"name": "uint32_t", "width": 32, "is_signed": False, "is_float": False, "is_pointer": False},
+                    }
+                ]
+            }
+        ]
+    }
+    edits, skip = fixer._generate_10_x_edits(findings_same_cat_same_width, dummy_v)
+    assert len(edits) == 0, f"Same-category same-width should produce no edits, got {len(edits)}"
+    print("  Same-category same-width correctly skipped ✓")
+
 
 def test_8_4_forward_declaration_autofix():
     """Test Rule 8.4 auto-fix: same-file forward declaration insertion."""
@@ -492,6 +559,112 @@ def test_8_4_forward_declaration_autofix():
     print("  No function context handled gracefully ✓")
 
 
+def test_violation_status_and_verify():
+    """Test violation status tracking, verify_fix logic, and _essential_category."""
+    section("VIOLATION STATUS & VERIFY FIX")
+
+    # ── Import server-level helpers ──
+    import importlib
+    import fastmcp_server as srv
+    importlib.reload(srv)  # ensure clean state
+
+    # ── Test 1: Status management basics ──
+    srv._violation_status = {}
+    assert srv._get_status("foo.c", 10, "MisraC2012-10.3") == "pending"
+    srv._set_status("foo.c", 10, "MisraC2012-10.3", "fixed")
+    assert srv._get_status("foo.c", 10, "MisraC2012-10.3") == "fixed"
+    srv._set_status("foo.c", 10, "MisraC2012-10.3", "verified")
+    assert srv._get_status("foo.c", 10, "MisraC2012-10.3") == "verified"
+    # Different violation at same file is independent
+    assert srv._get_status("foo.c", 10, "MisraC2012-8.13") == "pending"
+    print("  Status management basics ✓")
+
+    # ── Test 2: _essential_category ──
+    assert srv._essential_category({"name": "int", "is_signed": True, "is_float": False}) == "Signed"
+    assert srv._essential_category({"name": "unsigned int", "is_signed": False, "is_float": False}) == "Unsigned"
+    assert srv._essential_category({"name": "float", "is_signed": True, "is_float": True}) == "Floating"
+    assert srv._essential_category({"name": "bool", "is_signed": False, "is_float": False}) == "Boolean"
+    assert srv._essential_category({"name": "char", "is_signed": False, "is_float": False}) == "Character"
+    print("  _essential_category mapping ✓")
+
+    # ── Test 3: _verify_violation for 10.x with type mismatch still present ──
+    # We need a real C file with a type mismatch to verify against
+    import tempfile
+    c_code = b'void f(void) {\n  unsigned int w = 70000U;\n  unsigned short n = w;\n}\n'
+    with tempfile.NamedTemporaryFile(suffix='.c', delete=False, mode='wb') as f:
+        f.write(c_code)
+        tmp = f.name
+
+    try:
+        srv.analyzer = CAnalyzer(os.path.dirname(tmp))
+        # Line 3: unsigned short n = w;  → uint32 → uint16 narrowing
+        resolved, detail = srv._verify_violation("MisraC2012-10.3", tmp, 3)
+        # The expressions at line 3 should show narrowing (unsigned int → unsigned short)
+        # So this should report NOT resolved
+        assert resolved is False, f"Expected unresolved, got resolved: {detail}"
+        assert "narrow" in detail.lower() or "mismatch" in detail.lower(), \
+            f"Expected narrowing/mismatch in detail: {detail}"
+        print("  _verify_violation detects persisting 10.x narrowing ✓")
+    finally:
+        os.unlink(tmp)
+
+    # ── Test 4: _verify_violation for 10.x after fix (cast present) ──
+    c_fixed = b'void f(void) {\n  unsigned int w = 70000U;\n  unsigned short n = (unsigned short)w;\n}\n'
+    with tempfile.NamedTemporaryFile(suffix='.c', delete=False, mode='wb') as f:
+        f.write(c_fixed)
+        tmp2 = f.name
+
+    try:
+        srv.analyzer = CAnalyzer(os.path.dirname(tmp2))
+        resolved, detail = srv._verify_violation("MisraC2012-10.3", tmp2, 3)
+        # After the cast, the expression at line 3 is a cast_expression,
+        # the init_declarator's value is (unsigned short)w which should
+        # type-match the target.
+        assert resolved is True, f"Expected resolved after cast, got: {detail}"
+        print("  _verify_violation confirms 10.x fix with cast ✓")
+    finally:
+        os.unlink(tmp2)
+
+    # ── Test 5: _verify_violation for 2.7 (unused param) ──
+    c_unused = b'void g(int x) {\n  return;\n}\n'
+    with tempfile.NamedTemporaryFile(suffix='.c', delete=False, mode='wb') as f:
+        f.write(c_unused)
+        tmp3 = f.name
+
+    try:
+        srv.analyzer = CAnalyzer(os.path.dirname(tmp3))
+        resolved, detail = srv._verify_violation("MisraC2012-2.7", tmp3, 1)
+        assert resolved is False, f"Expected unused param detected: {detail}"
+        assert "x" in detail, f"Should mention param 'x': {detail}"
+        print("  _verify_violation detects unused param ✓")
+    finally:
+        os.unlink(tmp3)
+
+    # ── Test 6: _verify_violation for 2.7 (param used) ──
+    c_used = b'#include <stdio.h>\nvoid g(int x) {\n  (void)x;\n}\n'
+    with tempfile.NamedTemporaryFile(suffix='.c', delete=False, mode='wb') as f:
+        f.write(c_used)
+        tmp4 = f.name
+
+    try:
+        srv.analyzer = CAnalyzer(os.path.dirname(tmp4))
+        resolved, detail = srv._verify_violation("MisraC2012-2.7", tmp4, 2)
+        assert resolved is True, f"Expected param suppressed: {detail}"
+        print("  _verify_violation confirms 2.7 fix with (void)x ✓")
+    finally:
+        os.unlink(tmp4)
+
+    # ── Test 7: Fallback for unsupported rule ──
+    resolved, detail = srv._verify_violation("MisraC2012-99.9", "fake.c", 1)
+    assert resolved is True, "Unsupported rules should return True (fallback)"
+    assert "not available" in detail.lower(), f"Should mention fallback: {detail}"
+    print("  Fallback for unsupported rule ✓")
+
+    # Clean up
+    srv.analyzer = None
+    srv._violation_status = {}
+
+
 def run_tests():
     print("=" * 72)
     print("  COMPREHENSIVE MISRA AGENT TEST SUITE (AST-aware)")
@@ -529,6 +702,9 @@ def run_tests():
     # 9. Rule 8.4 FORWARD DECLARATION AUTO-FIX
     test_8_4_forward_declaration_autofix()
 
+    # 10. VIOLATION STATUS & VERIFY FIX
+    test_violation_status_and_verify()
+
     print("\n" + "=" * 72)
     print("  ALL TESTS PASSED ✓")
     print(f"  • {len(all_violations)} violations parsed")
@@ -536,6 +712,7 @@ def run_tests():
     print(f"  • AST analysis verified")
     print(f"  • Fix Engine confidence: {confidence_dist}")
     print(f"  • Automated fixes verified for 2.x, 8.x (incl. 8.4), 10.x, 11.x, 14.x, 15.x")
+    print(f"  • Violation status tracking & verify_fix verified")
     print("=" * 72)
 
 
