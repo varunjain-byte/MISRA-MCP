@@ -363,6 +363,73 @@ def test_10x_assignment_handling():
     assert edits[0]["text"] == "(uint8_t)(a + b)", f"Expected '(uint8_t)(a + b)', got '{edits[0]['text']}'"
     print("  Compound RHS parenthesized ✓")
 
+    # ── Test 7: Same-category narrowing generates cast (Rule 10.3) ──
+    # uint32_t → uint8_t: both Unsigned, but target is narrower → needs cast
+    findings_same_cat_narrow = {
+        "expressions": [
+            {
+                "type": "assignment_expression",
+                "operands": [
+                    {
+                        "text": "wide_val",
+                        "start_byte": 60,
+                        "end_byte": 68,
+                        "type": {"name": "uint32_t", "width": 32, "is_signed": False, "is_float": False, "is_pointer": False},
+                        "target_type": {"name": "uint8_t", "width": 8, "is_signed": False, "is_float": False, "is_pointer": False},
+                    }
+                ]
+            }
+        ]
+    }
+    edits, skip = fixer._generate_10_x_edits(findings_same_cat_narrow, dummy_v)
+    assert len(edits) == 1, f"Same-category narrowing: expected 1 edit, got {len(edits)}"
+    assert edits[0]["text"] == "(uint8_t)wide_val", f"Expected '(uint8_t)wide_val', got '{edits[0]['text']}'"
+    print("  Same-category narrowing cast (uint32→uint8) ✓")
+
+    # ── Test 8: Same-category widening is still skipped ──
+    # uint8_t → uint32_t: both Unsigned, target is wider → no cast needed
+    findings_same_cat_widen = {
+        "expressions": [
+            {
+                "type": "assignment_expression",
+                "operands": [
+                    {
+                        "text": "narrow_val",
+                        "start_byte": 70,
+                        "end_byte": 80,
+                        "type": {"name": "uint8_t", "width": 8, "is_signed": False, "is_float": False, "is_pointer": False},
+                        "target_type": {"name": "uint32_t", "width": 32, "is_signed": False, "is_float": False, "is_pointer": False},
+                    }
+                ]
+            }
+        ]
+    }
+    edits, skip = fixer._generate_10_x_edits(findings_same_cat_widen, dummy_v)
+    assert len(edits) == 0, f"Same-category widening should produce no edits, got {len(edits)}"
+    print("  Same-category widening correctly skipped (uint8→uint32) ✓")
+
+    # ── Test 9: Same-category, same-width is skipped ──
+    # unsigned int → unsigned int: no narrowing → no cast
+    findings_same_cat_same_width = {
+        "expressions": [
+            {
+                "type": "assignment_expression",
+                "operands": [
+                    {
+                        "text": "x",
+                        "start_byte": 90,
+                        "end_byte": 91,
+                        "type": {"name": "unsigned int", "width": 32, "is_signed": False, "is_float": False, "is_pointer": False},
+                        "target_type": {"name": "uint32_t", "width": 32, "is_signed": False, "is_float": False, "is_pointer": False},
+                    }
+                ]
+            }
+        ]
+    }
+    edits, skip = fixer._generate_10_x_edits(findings_same_cat_same_width, dummy_v)
+    assert len(edits) == 0, f"Same-category same-width should produce no edits, got {len(edits)}"
+    print("  Same-category same-width correctly skipped ✓")
+
 
 def test_8_4_forward_declaration_autofix():
     """Test Rule 8.4 auto-fix: same-file forward declaration insertion."""
