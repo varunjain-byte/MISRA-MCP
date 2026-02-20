@@ -188,10 +188,29 @@ class AxivionParser:
         that paths become workspace-relative with forward slashes
         (e.g. src/main.c).
 
+        When files don't exist on disk (e.g. report loaded without full
+        source tree), the method still produces best-guess relative paths
+        by stripping common build-system prefixes.
+
         On Windows, comparisons are case-insensitive.
         """
         ws = os.path.abspath(workspace_root)
         ws_nc = os.path.normcase(ws)   # lowercase on Windows, unchanged on POSIX
+
+        # Build a set of relative paths that actually exist in the workspace
+        # for fast lookup during suffix matching.
+        _existing_files: Dict[str, str] = {}  # basename → relative posix path
+        _existing_paths: set = set()           # full relative posix paths
+        for dirpath, _dirnames, filenames in os.walk(ws):
+            for fn in filenames:
+                full = os.path.join(dirpath, fn)
+                rel = os.path.relpath(full, ws).replace("\\", "/")
+                _existing_paths.add(rel)
+                # Store basename → rel; last-one-wins is fine, used only as hint
+                _existing_files[fn] = rel
+
+        matched = 0
+        guessed = 0
 
         for v in self.violations:
             fp = v.file_path
@@ -199,58 +218,134 @@ class AxivionParser:
             # Normalise separators for consistent matching
             fp_norm = fp.replace("\\", "/")
 
-            # Already relative and exists in workspace — normalise and keep
+            # ── Strategy 1: Already relative and exists in workspace ──
             if not os.path.isabs(fp):
-                native = fp.replace("/", os.sep).replace("\\", os.sep)
-                if os.path.isfile(os.path.join(ws, native)):
+                if fp_norm in _existing_paths:
                     v.file_path = fp_norm
+                    matched += 1
                     continue
 
-            # Absolute path that starts with workspace root (case-insensitive on Win)
+            # ── Strategy 2: Absolute path under workspace root ──
             abs_fp = os.path.abspath(fp) if os.path.isabs(fp) else fp
             abs_nc = os.path.normcase(abs_fp)
             if abs_nc.startswith(ws_nc + os.sep) or abs_nc.startswith(ws_nc + "/"):
                 v.file_path = os.path.relpath(abs_fp, ws).replace("\\", "/")
+                matched += 1
                 continue
 
-            # Try to match by finding the longest suffix that exists in workspace
+            # ── Strategy 3: Suffix match against real workspace files ──
             parts = fp_norm.split("/")
+            found_on_disk = False
             for i in range(len(parts)):
                 candidate_posix = "/".join(parts[i:])
-                candidate_native = candidate_posix.replace("/", os.sep)
-                if os.path.isfile(os.path.join(ws, candidate_native)):
+                if candidate_posix in _existing_paths:
                     v.file_path = candidate_posix
+                    matched += 1
+                    found_on_disk = True
                     break
-            else:
-                # No match found — at least normalise separators
-                v.file_path = fp_norm
+            if found_on_disk:
+                continue
+
+            # ── Strategy 4: Best-guess relative path (files not on disk) ──
+            # Strip well-known build-server / CI prefixes so the path
+            # becomes something the user can recognise and match against.
+            v.file_path = self._best_guess_relative(fp_norm)
+            guessed += 1
 
         logger.info(
-            "Normalised %d violation paths against workspace %s",
-            len(self.violations), workspace_root,
+            "Normalised %d violation paths against workspace %s "
+            "(%d matched on disk, %d best-guess)",
+            len(self.violations), workspace_root, matched, guessed,
         )
+
+    @staticmethod
+    def _best_guess_relative(fp_norm: str) -> str:
+        """Heuristically strip build-server prefixes to produce a relative path.
+
+        Given a path like ``/opt/axivion/checkout/source/App/main.c``, try
+        to find a recognisable source-tree root marker (``source/``,
+        ``src/``, ``include/``) and return everything from that marker
+        onward.  If no marker is found, return the filename only.
+        """
+        # Common directory names that typically sit at or near the project root
+        _SOURCE_MARKERS = (
+            "/source/", "/sources/", "/src/", "/include/",
+            "/app/", "/application/", "/lib/", "/core/",
+            "/modules/", "/components/", "/drivers/",
+        )
+
+        fp_lower = fp_norm.lower()
+        best_idx = len(fp_norm)  # worst case: full path
+
+        for marker in _SOURCE_MARKERS:
+            idx = fp_lower.find(marker)
+            if idx != -1:
+                # Keep from the marker directory onward (strip leading '/')
+                candidate_start = idx + 1  # skip the leading '/'
+                if candidate_start < best_idx:
+                    best_idx = candidate_start
+
+        if best_idx < len(fp_norm):
+            return fp_norm[best_idx:]
+
+        # No marker found — just return the filename portion
+        return fp_norm.rsplit("/", 1)[-1]
 
     # ────────────────────────────────────────────────────────────────
     #  Queries
     # ────────────────────────────────────────────────────────────────
 
     def get_violations_by_file(self, file_path: str) -> List[AxivionViolation]:
-        """Get violations for a file, using suffix matching for robustness."""
-        # Normalise separators
+        """Get violations for a file, using multi-tier matching for robustness.
+
+        Matching tiers (returns on first tier that produces results):
+          1. Exact match (case-sensitive)
+          2. Case-insensitive exact match
+          3. Suffix match (either direction)
+          4. Case-insensitive suffix match
+          5. Basename match (case-insensitive)
+        """
         query = file_path.replace("\\", "/").rstrip("/")
-        results = []
+        query_lower = query.lower()
+        query_base = query.rsplit("/", 1)[-1].lower()
+
+        exact = []
+        exact_ci = []
+        suffix = []
+        suffix_ci = []
+        basename = []
+
         for v in self.violations:
             vp = v.file_path.replace("\\", "/").rstrip("/")
-            # Exact match
+            vp_lower = vp.lower()
+
+            # Tier 1: Exact
             if vp == query:
-                results.append(v)
-            # Suffix match: query "src/main.c" matches "/opt/.../src/main.c"
-            elif vp.endswith("/" + query) or query.endswith("/" + vp):
-                results.append(v)
-            # Basename match as last resort (only if unique enough: has dir)
-            elif "/" not in query and os.path.basename(vp) == query:
-                results.append(v)
-        return results
+                exact.append(v)
+                continue
+
+            # Tier 2: Case-insensitive exact
+            if vp_lower == query_lower:
+                exact_ci.append(v)
+                continue
+
+            # Tier 3: Suffix match (case-sensitive)
+            if vp.endswith("/" + query) or query.endswith("/" + vp):
+                suffix.append(v)
+                continue
+
+            # Tier 4: Suffix match (case-insensitive)
+            if vp_lower.endswith("/" + query_lower) or query_lower.endswith("/" + vp_lower):
+                suffix_ci.append(v)
+                continue
+
+            # Tier 5: Basename match (case-insensitive, works with or without dir in query)
+            vp_base = vp.rsplit("/", 1)[-1].lower()
+            if vp_base == query_base:
+                basename.append(v)
+
+        # Return the most specific tier that has results
+        return exact or exact_ci or suffix or suffix_ci or basename
 
     def get_violation_by_id(self, rule_id: str) -> List[AxivionViolation]:
         return [v for v in self.violations if v.rule_id == rule_id]
