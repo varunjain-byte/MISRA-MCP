@@ -29,6 +29,31 @@ _parser = Parser(C_LANGUAGE)
 # File extensions we index
 _C_EXTENSIONS = {".c", ".h", ".cc", ".cpp", ".hh", ".hpp"}
 
+# Directories to skip during workspace scanning.  These contain non-project
+# C/H files (Python packages, IDE extensions, caches) that slow down indexing
+# and generate spurious "Include file not found" warnings from pcpp.
+_SKIP_DIRS = {
+    # Version control
+    ".git", ".svn", ".hg",
+    # Build artifacts
+    "build", "cmake-build-debug", "cmake-build-release", "out", "_build",
+    # IDE / editor
+    ".vscode", ".idea", ".bobide", ".vs", ".settings",
+    # Python environments and caches
+    "__pycache__", "node_modules", "venv", ".venv", "env", ".env",
+    "site-packages", ".tox", ".nox", ".eggs", "dist", "egg-info",
+    # System / user caches that may appear under broad workspace roots
+    "AppData", ".local", ".cache", "Cache", "CachedData",
+    # Python package managers
+    "pypoetry", "pip",
+    # IDE extensions (VS Code, bobide, etc.)
+    "extensions",
+    # Documentation / non-source
+    "docs", "doc", "Documentation",
+    # Test fixtures that are not real project code
+    ".pytest_cache",
+}
+
 
 def _norm_path(p: str) -> str:
     """Normalise a path to forward slashes for cross-platform consistency.
@@ -49,15 +74,11 @@ def discover_include_dirs(workspace_root: str) -> List[str]:
     at least one header file.  This provides a reasonable default for
     projects that don't supply an explicit list of include paths.
     """
-    skip_dirs = {
-        ".git", "build", "cmake-build-debug", "cmake-build-release",
-        "__pycache__", "node_modules", ".vscode", ".idea", "venv",
-    }
     header_exts = {".h", ".hh", ".hpp"}
     include_dirs: Set[str] = set()
 
     for root, dirs, filenames in os.walk(workspace_root):
-        dirs[:] = [d for d in dirs if d not in skip_dirs]
+        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
         for fname in filenames:
             if os.path.splitext(fname)[1].lower() in header_exts:
                 rel_dir = os.path.relpath(root, workspace_root)
@@ -738,11 +759,7 @@ class WorkspaceIndex:
         """Find all C/H files in the workspace."""
         files = []
         for root, dirs, filenames in os.walk(self.workspace_root):
-            # Skip common non-source directories
-            dirs[:] = [d for d in dirs if d not in {
-                ".git", "build", "cmake-build-debug", "cmake-build-release",
-                "__pycache__", "node_modules", ".vscode", ".idea", "venv",
-            }]
+            dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
             for fname in filenames:
                 ext = os.path.splitext(fname)[1].lower()
                 if ext in _C_EXTENSIONS:

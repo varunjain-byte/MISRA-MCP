@@ -45,8 +45,13 @@ class CType:
 class TypeSystem:
     """
     Manages C types, standard MISRA essential type models, and arithmetic conversions.
+
+    When a WorkspaceIndex is available, its TypeRegistry is used as a
+    fallback to resolve project-specific typedefs (e.g. AUTOSAR ``uint8``,
+    ``ErrorStatusType``) by chasing the typedef chain back to a known
+    primitive type.
     """
-    
+
     def __init__(self):
         # Standard primitives (assuming 32-bit int, 64-bit long for analysis)
         self.types: Dict[str, CType] = {
@@ -66,25 +71,69 @@ class TypeSystem:
             "bool":   CType("bool", 1, False),
             "_Bool":  CType("_Bool", 1, False),
         }
-        
+
         # stdint.h types
         for w in (8, 16, 32, 64):
             self.types[f"int{w}_t"] = CType(f"int{w}_t", w, True)
             self.types[f"uint{w}_t"] = CType(f"uint{w}_t", w, False)
 
+        # Optional typedef resolver (set via set_type_registry)
+        self._type_registry = None
+
+    def set_type_registry(self, type_registry) -> None:
+        """Attach a WorkspaceIndex TypeRegistry for typedef resolution.
+
+        When ``get_type()`` can't find a name among known primitives, it
+        will follow the typedef chain in the registry (e.g.
+        ``uint8 → unsigned char → CType``).
+        """
+        self._type_registry = type_registry
+
+    def register_typedef(self, alias: str, resolved_type: "CType") -> None:
+        """Directly register a typedef alias as a known type."""
+        self.types[alias] = resolved_type
+
     def get_type(self, type_name: str) -> Optional[CType]:
-        """Resolve a type definition string to a CType."""
+        """Resolve a type definition string to a CType.
+
+        Resolution order:
+          1. Direct lookup in known types (primitives + stdint)
+          2. If a TypeRegistry is attached, follow the typedef chain
+             until a known primitive is found
+        """
         name = type_name.strip()
-        
+
         # Handle pointers roughly
         if "*" in name:
             return CType(name, 64, False, is_pointer=True) # Pointers are 64-bit unsigned-ish
-            
+
         # Strip common qualifiers
         cleaned = re.sub(r'\b(const|volatile|static|register|extern)\b', '', name).strip()
         cleaned = re.sub(r'\s+', ' ', cleaned)
-        
-        return self.types.get(cleaned)
+
+        # 1. Direct lookup
+        result = self.types.get(cleaned)
+        if result is not None:
+            return result
+
+        # 2. Follow typedef chain via workspace TypeRegistry
+        if self._type_registry is not None:
+            resolved_name = self._type_registry.resolve(cleaned)
+            if resolved_name != cleaned:
+                # Strip qualifiers from resolved name too
+                resolved_clean = re.sub(r'\b(const|volatile|static|register|extern)\b', '', resolved_name).strip()
+                resolved_clean = re.sub(r'\s+', ' ', resolved_clean)
+                base_type = self.types.get(resolved_clean)
+                if base_type is not None:
+                    # Cache so future lookups are instant
+                    self.types[cleaned] = CType(
+                        cleaned, base_type.width, base_type.is_signed,
+                        is_float=base_type.is_float,
+                        is_pointer=base_type.is_pointer,
+                    )
+                    return self.types[cleaned]
+
+        return None
 
     def get_essential_type(self, type_obj: CType) -> str:
         """
@@ -190,6 +239,16 @@ class CAnalyzer:
         self.preprocessor = preprocessor # Optional PreprocessorEngine
         self._cache: Dict[str, Tuple[bytes, object]] = {}  # path -> (source, tree)
         self.type_system = TypeSystem()
+
+        # Wire workspace typedef information into the type system so that
+        # project-specific types (uint8, ErrorStatusType, etc.) resolve to
+        # their underlying primitive types during analysis.
+        if workspace_index is not None and hasattr(workspace_index, 'types'):
+            self.type_system.set_type_registry(workspace_index.types)
+            logger.info(
+                "TypeSystem: attached TypeRegistry with %d aliases",
+                workspace_index.types.total_aliases,
+            )
 
     def _resolve(self, file_path: str) -> str:
         """Resolve a (possibly POSIX-style) relative path to an absolute path."""
