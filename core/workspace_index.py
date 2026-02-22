@@ -41,6 +41,33 @@ def _norm_path(p: str) -> str:
     return p.replace("\\", "/")
 
 
+def discover_include_dirs(workspace_root: str) -> List[str]:
+    """Auto-discover include directories by finding all dirs containing .h files.
+
+    Walks the workspace tree (skipping common non-source dirs) and returns
+    a sorted list of directories (relative to workspace_root) that contain
+    at least one header file.  This provides a reasonable default for
+    projects that don't supply an explicit list of include paths.
+    """
+    skip_dirs = {
+        ".git", "build", "cmake-build-debug", "cmake-build-release",
+        "__pycache__", "node_modules", ".vscode", ".idea", "venv",
+    }
+    header_exts = {".h", ".hh", ".hpp"}
+    include_dirs: Set[str] = set()
+
+    for root, dirs, filenames in os.walk(workspace_root):
+        dirs[:] = [d for d in dirs if d not in skip_dirs]
+        for fname in filenames:
+            if os.path.splitext(fname)[1].lower() in header_exts:
+                rel_dir = os.path.relpath(root, workspace_root)
+                include_dirs.add(_norm_path(rel_dir))
+                break  # one header is enough to register this directory
+
+    logger.info("Auto-discovered %d include directories", len(include_dirs))
+    return sorted(include_dirs)
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  Data types
 # ═══════════════════════════════════════════════════════════════════════
@@ -457,7 +484,10 @@ class WorkspaceIndex:
     def __init__(self, workspace_root: str, include_dirs: Optional[List[str]] = None, preprocessor=None):
         self.workspace_root = workspace_root
         self.preprocessor = preprocessor
-        self.include_graph = IncludeGraph(workspace_root, include_dirs)
+        # Store include dirs for both IncludeGraph and preprocessor calls.
+        # If none provided, auto-discover from workspace.
+        self.include_dirs = include_dirs if include_dirs is not None else discover_include_dirs(workspace_root)
+        self.include_graph = IncludeGraph(workspace_root, self.include_dirs)
         self.symbols = SymbolTable()
         self.call_graph = CallGraph()
         self.types = TypeRegistry()
@@ -765,10 +795,7 @@ class WorkspaceIndex:
         
         if self.preprocessor and rel_path.endswith(".c"):
             try:
-                # Use workspace root as include dir, plus explicit include dirs if we knew them.
-                # WorkspaceIndex doesn't strictly track include dirs configuration per file.
-                # We assume relative paths from workspace root work or are standard.
-                expanded, _ = self.preprocessor.preprocess(rel_path, include_dirs=["."])
+                expanded, _ = self.preprocessor.preprocess(rel_path, include_dirs=self.include_dirs)
                 if expanded and len(expanded.strip()) > 0:
                     target_source = expanded
                     use_mapping = True

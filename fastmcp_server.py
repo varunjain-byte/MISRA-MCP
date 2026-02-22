@@ -3,16 +3,17 @@ Axivion MISRA Agent — MCP Server
 
 Exposes tools to GitHub Copilot via the Model Context Protocol:
 
-  1. load_report       — load an Axivion JSON report + workspace root
-  2. list_violations   — list all violations for a file (shows fix status)
-  3. analyze_violation — deep analysis: code context + AST + cross-file + rule
-  4. explain_rule      — full MISRA rule explanation with examples
-  5. propose_fix       — AST-informed fix analysis with structural evidence
-  6. cross_file_impact — show which files are affected by fixing a symbol
-  7. apply_fix         — automatically apply suggested fixes + mark status
-  8. coverage_report   — list all supported rules and statistics
-  9. verify_fix        — re-run AST analysis to confirm a fix resolved the violation
- 10. fix_all           — iterate fix → verify for every violation in a file
+  1.  load_report       — load an Axivion JSON report + workspace root
+  1b. set_include_dirs  — reconfigure include paths & defines, rebuild index
+  2.  list_violations   — list all violations for a file (shows fix status)
+  3.  analyze_violation — deep analysis: code context + AST + cross-file + rule
+  4.  explain_rule      — full MISRA rule explanation with examples
+  5.  propose_fix       — AST-informed fix analysis with structural evidence
+  6.  cross_file_impact — show which files are affected by fixing a symbol
+  7.  apply_fix         — automatically apply suggested fixes + mark status
+  8.  coverage_report   — list all supported rules and statistics
+  9.  verify_fix        — re-run AST analysis to confirm a fix resolved the violation
+ 10.  fix_all           — iterate fix → verify for every violation in a file
 """
 
 from mcp.server.fastmcp import FastMCP
@@ -25,7 +26,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from core.axivion_parser import AxivionParser
 from core.context_provider import ContextProvider
 from core.c_analyzer import CAnalyzer
-from core.workspace_index import WorkspaceIndex
+from core.workspace_index import WorkspaceIndex, discover_include_dirs
 from core.preprocessor import PreprocessorEngine
 from core.misra_knowledge_base import format_rule_explanation, get_rule
 from core.fix_engine import FixEngine
@@ -165,7 +166,7 @@ def _find_violation(rule_id: str, file_path: str, line_number: int):
 # ═══════════════════════════════════════════════════════════════════════
 
 @mcp.tool()
-def load_report(report_path: str, workspace_root: str) -> str:
+def load_report(report_path: str, workspace_root: str, include_dirs: str = "") -> str:
     """
     Loads the Axivion analysis report and initialises the context provider.
 
@@ -176,6 +177,10 @@ def load_report(report_path: str, workspace_root: str) -> str:
     Args:
         report_path:    Absolute path to the Axivion JSON report.
         workspace_root: Root directory of the workspace containing source code.
+        include_dirs:   Comma-separated list of include directories (relative to
+                        workspace_root).  If empty, directories containing .h
+                        files are auto-discovered from the workspace.
+                        Example: "source/Include,Autosar/BSW,lib/third_party"
     """
     global parser, context_provider, analyzer, fix_engine, workspace_index, preprocessor, _violation_status
 
@@ -202,8 +207,17 @@ def load_report(report_path: str, workspace_root: str) -> str:
         except Exception as e:
             return f"Error initializing PreprocessorEngine: {e}"
 
-        # Build cross-file index
-        workspace_index = WorkspaceIndex(workspace_root, preprocessor=preprocessor)
+        # Resolve include directories: explicit list or auto-discover
+        resolved_include_dirs = None
+        if include_dirs.strip():
+            resolved_include_dirs = [d.strip() for d in include_dirs.split(",") if d.strip()]
+
+        # Build cross-file index (auto-discovers include dirs if none provided)
+        workspace_index = WorkspaceIndex(
+            workspace_root,
+            include_dirs=resolved_include_dirs,
+            preprocessor=preprocessor,
+        )
         workspace_index.build()
 
         # Create analyzer with cross-file support
@@ -212,14 +226,87 @@ def load_report(report_path: str, workspace_root: str) -> str:
 
         count = len(parser.get_all_violations())
         idx = workspace_index.get_summary()
+        inc_count = len(workspace_index.include_dirs)
         return (
             f"Successfully loaded report. Found {count} violations.\n"
             f"Workspace indexed: {idx['c_files']} .c files, {idx['h_files']} .h files, "
             f"{idx['symbols']} symbols, {idx['call_sites']} call sites.\n"
+            f"Include directories: {inc_count} configured.\n"
             f"Preprocessor Engine initialized."
         )
     except Exception as e:
         return f"Error loading report: {e}"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Tool 1b — Set Include Dirs (post-load reconfiguration)
+# ═══════════════════════════════════════════════════════════════════════
+
+@mcp.tool()
+def set_include_dirs(include_dirs: str = "", extra_defines: str = "") -> str:
+    """
+    Reconfigure include directories and preprocessor defines, then rebuild
+    the workspace index.  Use this after load_report if the initial
+    auto-discovered include paths are insufficient.
+
+    Args:
+        include_dirs:   Comma-separated list of include directories (relative to
+                        workspace_root).  If empty, re-runs auto-discovery.
+                        Example: "source/Include,Autosar/BSW/Include,lib"
+        extra_defines:  Comma-separated preprocessor defines (NAME=VALUE or NAME).
+                        Example: "PLATFORM_X=1,ENABLE_CRYPTO,DEBUG=0"
+    """
+    global workspace_index, analyzer, fix_engine, preprocessor
+
+    if workspace_index is None or preprocessor is None:
+        return "Error: No report loaded. Call load_report first."
+
+    ws_root = workspace_index.workspace_root
+
+    # Resolve include dirs
+    if include_dirs.strip():
+        resolved_dirs = [d.strip() for d in include_dirs.split(",") if d.strip()]
+    else:
+        resolved_dirs = discover_include_dirs(ws_root)
+
+    # Apply extra defines to preprocessor
+    if extra_defines.strip():
+        for define in extra_defines.split(","):
+            define = define.strip()
+            if not define:
+                continue
+            if "=" in define:
+                name, value = define.split("=", 1)
+                preprocessor.add_define(name.strip(), value.strip())
+            else:
+                preprocessor.add_define(define)
+
+    # Clear preprocessor cache so files are re-expanded with new paths/defines
+    preprocessor._cache.clear()
+
+    # Rebuild workspace index with new include dirs
+    workspace_index = WorkspaceIndex(
+        ws_root,
+        include_dirs=resolved_dirs,
+        preprocessor=preprocessor,
+    )
+    workspace_index.build()
+
+    # Recreate analyzer with updated index
+    context_provider = ContextProvider(ws_root)
+    analyzer = CAnalyzer(ws_root, workspace_index=workspace_index, preprocessor=preprocessor)
+    fix_engine = FixEngine(analyzer, context_provider)
+
+    idx = workspace_index.get_summary()
+    inc_count = len(workspace_index.include_dirs)
+    defines_count = len(preprocessor.defines)
+    return (
+        f"Workspace re-indexed with {inc_count} include directories"
+        f" and {defines_count} preprocessor defines.\n"
+        f"Indexed: {idx['c_files']} .c files, {idx['h_files']} .h files, "
+        f"{idx['symbols']} symbols, {idx['call_sites']} call sites, "
+        f"{idx['type_aliases']} type aliases."
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
