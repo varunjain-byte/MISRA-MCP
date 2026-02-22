@@ -358,10 +358,7 @@ class FixEngine:
 
         # ── Rule 8.x — Declarations & Definitions ───────────────────
         if rid == "MisraC2012-8.1":
-            return ([], "Rule 8.1 (implicit types) requires semantic "
-                        "knowledge of the intended type. The correct type "
-                        "depends on the programmer's intent — no safe default "
-                        "exists.")
+            return self._generate_8_1_edits(findings, violation)
         if rid == "MisraC2012-8.2":
             return self._generate_8_2_edits(findings, violation)
         if rid == "MisraC2012-8.3":
@@ -679,6 +676,56 @@ class FixEngine:
     # ────────────────────────────────────────────────────────────────
     #  Edit generators — Rule 8.x (Declarations & Definitions)
     # ────────────────────────────────────────────────────────────────
+
+    def _generate_8_1_edits(self, findings: Dict,
+                            violation: AxivionViolation
+                            ) -> "tuple[List[Dict], str]":
+        """Rule 8.1: Types shall be explicitly stated.
+
+        Common patterns that can be diagnosed (but not always auto-fixed):
+          - Missing return type on function definition (implicit int)
+          - K&R-style parameter declarations
+
+        When a function was found via the preprocessor (AUTOSAR macro
+        expansion), we can report the function name and signature but
+        still cannot safely pick the correct explicit type — that depends
+        on programmer intent.
+
+        Returns edits only for the trivial 'missing return type' case
+        where the preprocessed AST reveals the actual return type.
+        """
+        fn_info = findings.get("function") or {}
+        raw_line = findings.get("raw_source_line", "")
+        pattern = findings.get("implicit_pattern", "")
+
+        # If we found the function via preprocessing, report what we know
+        if fn_info and fn_info.get("_from_preprocessed"):
+            ret_type = fn_info.get("return_type", "")
+            if ret_type and ret_type != "int":
+                # We know the actual return type from preprocessing — but
+                # the violation is on the raw (macro-wrapped) source.
+                # We can't safely edit the macro invocation.
+                return ([], f"Function `{fn_info.get('name', '?')}` has "
+                            f"return type `{ret_type}` after macro expansion. "
+                            f"The implicit type comes from the AUTOSAR macro "
+                            f"wrapper — verify the macro definition expands to "
+                            f"the correct type specifier.")
+
+        if pattern == "missing_return_type" and raw_line:
+            return ([], f"Line appears to define a function without an "
+                        f"explicit return type: `{raw_line[:80]}`. "
+                        f"Add `int`, `void`, or the appropriate return type "
+                        f"before the function name.")
+
+        if pattern == "kr_style_params":
+            return ([], "K&R-style parameter declarations detected. "
+                        "Convert to ANSI/ISO prototype form with typed "
+                        "parameters inside the parentheses.")
+
+        return ([], "Rule 8.1 (implicit types) requires semantic "
+                    "knowledge of the intended type. The correct type "
+                    "depends on the programmer's intent — no safe default "
+                    "exists.")
 
     def _generate_8_2_edits(self, findings: Dict,
                             violation: AxivionViolation
@@ -1529,6 +1576,39 @@ class FixEngine:
                 )
             return rule.fix_strategy
 
+        # ── Rule 8.1: Implicit types ──
+        if rid == "MisraC2012-8.1":
+            fn_info = findings.get("function", {})
+            raw_line = findings.get("raw_source_line", "")
+            pattern = findings.get("implicit_pattern", "")
+            parts = []
+            if fn_info:
+                parts.append(
+                    f"Function `{fn_info.get('name', '?')}` "
+                    f"(signature: `{fn_info.get('signature', '?')}`)."
+                )
+                if fn_info.get("_from_preprocessed"):
+                    ret = fn_info.get("return_type", "")
+                    if ret:
+                        parts.append(
+                            f"After macro expansion the return type is `{ret}`."
+                        )
+            if raw_line:
+                parts.append(f"Source: `{raw_line[:100]}`")
+            if pattern == "missing_return_type":
+                parts.append(
+                    "**Fix**: Add the explicit return type (`int`, `void`, "
+                    "or the appropriate type) before the function name."
+                )
+            elif pattern == "kr_style_params":
+                parts.append(
+                    "**Fix**: Convert K&R parameter declarations to ANSI/ISO "
+                    "prototype form with typed parameters inside parentheses."
+                )
+            else:
+                parts.append(rule.fix_strategy)
+            return "\n\n".join(parts) if parts else rule.fix_strategy
+
         # ── Rule 8.2: Unnamed parameters in prototype ──
         if rid == "MisraC2012-8.2":
             cross = findings.get("cross_file", {})
@@ -1729,6 +1809,10 @@ class FixEngine:
             cross = findings.get("cross_file", {})
             if cross and cross.get("array_size") is not None:
                 return "HIGH"
+
+        # Rule 8.1: pattern detected (not auto-fixable but we know the issue)
+        if rid == "MisraC2012-8.1" and findings.get("implicit_pattern"):
+            return "MEDIUM"
 
         # Rule 8.2: definition params available to copy to declaration
         if rid == "MisraC2012-8.2":

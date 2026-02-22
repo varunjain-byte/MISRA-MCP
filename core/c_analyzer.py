@@ -1001,8 +1001,11 @@ class CAnalyzer:
             # Rule 8.4 violations can appear on function definitions or
             # variable definitions at file scope.  When get_function_at_line
             # returns None (violation is not inside a function body), we
-            # fall back to _extract_symbol_name + workspace index lookup
-            # to find the signature.
+            # try three progressively deeper strategies:
+            #   1. _extract_symbol_name + workspace index
+            #   2. _enrich_8_4_from_index (source-line extraction)
+            #   3. Preprocessor-aware AST walk (_get_function_at_line_pp)
+            #      which handles AUTOSAR macros like FUNC(void, APP_CODE).
             sym_name = fn.name if fn else self._extract_symbol_name(file_path, line)
             if sym_name:
                 if not fn:
@@ -1012,6 +1015,20 @@ class CAnalyzer:
                     analysis["cross_file"] = self.index.check_rule_8_4(
                         sym_name, file_path
                     )
+
+            # ── Preprocessor fallback ──
+            # If raw tree-sitter parsing couldn't find the function (common
+            # for AUTOSAR macro-wrapped definitions), preprocess the file to
+            # expand macros and try again.
+            if not analysis.get("function") or analysis["function"] is None:
+                pp_fn = self._get_function_at_line_pp(file_path, line)
+                if pp_fn:
+                    analysis["function"] = pp_fn
+                    sym_name = pp_fn["name"]
+                    if self.index and self.index.is_built:
+                        analysis["cross_file"] = self.index.check_rule_8_4(
+                            sym_name, file_path
+                        )
 
         elif rule_id == "MisraC2012-8.5":
             sym = self._extract_symbol_name(file_path, line)
@@ -1026,11 +1043,24 @@ class CAnalyzer:
                 if self.index and self.index.is_built:
                     analysis["cross_file"] = self.index.check_rule_8_6(sym)
 
-        elif rule_id == "MisraC2012-8.8" and fn:
-            analysis["needs_static"] = not fn.is_static
-            if self.index and self.index.is_built:
+        elif rule_id == "MisraC2012-8.8":
+            # Use raw fn or preprocessor fallback for macro-wrapped functions
+            fn_8_8 = fn
+            if not fn_8_8:
+                pp_fn = self._get_function_at_line_pp(file_path, line)
+                if pp_fn:
+                    analysis["function"] = pp_fn
+                    fn_8_8_name = pp_fn["name"]
+                    analysis["needs_static"] = not pp_fn.get("is_static", False)
+                else:
+                    fn_8_8_name = None
+            else:
+                fn_8_8_name = fn_8_8.name
+                analysis["needs_static"] = not fn_8_8.is_static
+
+            if fn_8_8_name and self.index and self.index.is_built:
                 analysis["cross_file"] = self.index.check_rule_8_8(
-                    fn.name, file_path
+                    fn_8_8_name, file_path
                 )
                 # Override simple heuristic with cross-file evidence
                 cf = analysis["cross_file"]
@@ -1215,6 +1245,33 @@ class CAnalyzer:
             if missing_braces:
                 analysis["missing_braces"] = missing_braces
 
+        elif rule_id == "MisraC2012-8.1":
+            # ── Rule 8.1: Types shall be explicitly stated ──
+            # Try to find function context (raw parse or preprocessed)
+            # so the fix engine and guidance can describe what's missing.
+            if not fn:
+                pp_fn = self._get_function_at_line_pp(file_path, line)
+                if pp_fn:
+                    analysis["function"] = pp_fn
+            # Also extract the raw source line for pattern detection
+            source_lines = self._source_lines(file_path)
+            if 0 < line <= len(source_lines):
+                raw_line = source_lines[line - 1].strip()
+                analysis["raw_source_line"] = raw_line
+                # Detect common 8.1 patterns:
+                # 1. K&R parameter style: void foo(x) int x; { ... }
+                # 2. Missing return type: foo(void) { ... }
+                # 3. Implicit int: static bar = 5;
+                if re.match(r'^[\w_]+\s*\(', raw_line) and not re.match(
+                    r'^\s*(void|int|char|short|long|float|double|unsigned|signed'
+                    r'|_Bool|struct|enum|union|static|extern|inline|const'
+                    r'|volatile|FUNC|STATIC|P2VAR|P2CONST|P2FUNC|CONSTP2VAR'
+                    r'|CONSTP2CONST|CONSTP2FUNC|VAR)\b', raw_line
+                ):
+                    analysis["implicit_pattern"] = "missing_return_type"
+                elif re.search(r'\)\s+\w+\s+\w+\s*;', raw_line):
+                    analysis["implicit_pattern"] = "kr_style_params"
+
         elif rule_id.startswith("MisraC2012-8."):
             # Generic linkage analysis for remaining 8.x rules
             sym = self._extract_symbol_name(file_path, line)
@@ -1272,6 +1329,133 @@ class CAnalyzer:
                     "body_lines": 1,
                 }
 
+    def _get_function_at_line_pp(self, file_path: str, line: int) -> Optional[Dict]:
+        """Find function context using preprocessed source (macro expansion).
+
+        When raw tree-sitter parsing fails to recognise a function definition
+        (common for AUTOSAR macro-wrapped functions such as
+        ``FUNC(void, APP_CODE) My_Func(void) { ... }``), this method:
+
+          1.  Preprocesses the file (lazy, cached via ``_get_preprocessed_tree``).
+          2.  Finds ``function_definition`` nodes in the expanded AST.
+          3.  Maps each expanded line back to the *original* source via the
+              preprocessor's ``#line`` map.
+          4.  Returns a ``dict`` compatible with ``analysis["function"]``
+              whose ``signature`` is extracted from the *original* source
+              (preserving project-specific macros so that the forward
+              declaration matches the definition style).
+
+        Returns ``None`` when no matching function is found.
+        """
+        if self.preprocessor is None:
+            return None
+
+        pp_source, pp_tree = self._get_preprocessed_tree(file_path)
+        if pp_tree is None or pp_source is None:
+            return None
+
+        # Relative path used by the preprocessor cache
+        rel_path = file_path.replace(os.sep, "/")
+        if os.path.isabs(rel_path):
+            rel_path = os.path.relpath(rel_path, self.workspace_root).replace(os.sep, "/")
+
+        target_norm = file_path.replace("\\", "/").strip("/")
+
+        for node in self._walk_type(pp_tree.root_node, "function_definition"):
+            fn = self._extract_function(node, pp_source, file_path)
+            if fn is None:
+                continue
+
+            # Map expanded start / end lines back to original source
+            orig_file_s, orig_line_s = self.preprocessor.get_original_location(
+                rel_path, fn.start_line
+            )
+            orig_file_e, orig_line_e = self.preprocessor.get_original_location(
+                rel_path, fn.end_line
+            )
+
+            # Only consider functions from the file itself, not from includes
+            check = orig_file_s.replace("\\", "/").strip("/")
+            if not (check.endswith(target_norm) or target_norm.endswith(check)):
+                continue
+
+            if not (orig_line_s <= line <= orig_line_e):
+                continue
+
+            # Build signature from the ORIGINAL source (preserves AUTOSAR macros)
+            source_lines = self._source_lines(file_path)
+            orig_sig = ""
+            if 0 < orig_line_s <= len(source_lines):
+                sig_parts = []
+                for i in range(orig_line_s - 1,
+                               min(orig_line_e, len(source_lines))):
+                    l = source_lines[i].rstrip("\n").rstrip("\r")
+                    sig_parts.append(l)
+                    if "{" in l:
+                        break
+                orig_sig = " ".join(sig_parts).split("{")[0].strip()
+
+            if not orig_sig:
+                orig_sig = fn.signature  # Fallback to expanded signature
+
+            return {
+                "name": fn.name,
+                "signature": orig_sig,
+                "return_type": fn.return_type,
+                "start_line": orig_line_s,
+                "end_line": orig_line_e,
+                "is_static": fn.is_static or "static" in orig_sig.lower(),
+                "is_inline": fn.is_inline or "inline" in orig_sig.lower(),
+                "body_lines": orig_line_e - orig_line_s + 1,
+                "_from_preprocessed": True,
+            }
+
+        return None
+
+    def _extract_symbol_name_pp(self, file_path: str, line: int) -> Optional[str]:
+        """Extract symbol name using preprocessed source as fallback.
+
+        Called when ``_extract_symbol_name()`` fails on raw source (the AST
+        didn't contain a recognisable declaration at the target line because
+        of unexpanded macros).
+
+        Preprocesses the file, walks function definitions in the expanded
+        AST, maps back to original line numbers, and returns the function
+        name if one starts at the given line.
+        """
+        if self.preprocessor is None:
+            return None
+
+        pp_source, pp_tree = self._get_preprocessed_tree(file_path)
+        if pp_tree is None or pp_source is None:
+            return None
+
+        rel_path = file_path.replace(os.sep, "/")
+        if os.path.isabs(rel_path):
+            rel_path = os.path.relpath(rel_path, self.workspace_root).replace(os.sep, "/")
+
+        target_norm = file_path.replace("\\", "/").strip("/")
+
+        for node in self._walk_type(pp_tree.root_node, "function_definition"):
+            fn = self._extract_function(node, pp_source, file_path)
+            if fn is None:
+                continue
+
+            orig_file, orig_line = self.preprocessor.get_original_location(
+                rel_path, fn.start_line
+            )
+            check = orig_file.replace("\\", "/").strip("/")
+            if not (check.endswith(target_norm) or target_norm.endswith(check)):
+                continue
+
+            # Allow a small tolerance: violation might point to any line
+            # within the function definition header (return type, name,
+            # parameter list, opening brace).
+            if abs(orig_line - line) <= 3:
+                return fn.name
+
+        return None
+
     def _extract_symbol_name(self, file_path: str, line: int) -> Optional[str]:
         """Extract the primary symbol name declared/defined at a given line.
 
@@ -1325,6 +1509,11 @@ class CAnalyzer:
                 for c in candidates:
                     if c not in kw:
                         return c
+
+        # Strategy 3: preprocessed tree fallback (handles AUTOSAR macros)
+        pp_name = self._extract_symbol_name_pp(file_path, line)
+        if pp_name:
+            return pp_name
 
         return None
 
