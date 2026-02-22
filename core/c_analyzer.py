@@ -265,7 +265,9 @@ class CAnalyzer:
             return self._cache[full]
 
         if not os.path.isfile(full):
-            logger.warning("File not found: %s", full)
+            # Use debug level — this fires frequently for cross-file lookups
+            # where the violation path doesn't match disk layout exactly.
+            logger.debug("File not found: %s", full)
             return None, None
 
         try:
@@ -315,10 +317,13 @@ class CAnalyzer:
                     expanded = expanded.encode("utf-8")
                 tree = _parser.parse(expanded)
                 self._cache[cache_key] = (expanded, tree)
-                logger.info("On-demand preprocessed %s (%d bytes)", rel_path, len(expanded))
+                logger.debug("On-demand preprocessed %s (%d bytes)", rel_path, len(expanded))
                 return expanded, tree
+        except RecursionError:
+            logger.debug("On-demand preprocessing hit recursion limit for %s "
+                         "(likely MemMap.h pattern) — using raw source", rel_path)
         except Exception as e:
-            logger.warning("On-demand preprocessing failed for %s, using raw: %s", rel_path, e)
+            logger.debug("On-demand preprocessing failed for %s, using raw: %s", rel_path, e)
 
         # Fallback to raw source
         return self._get_tree(file_path)

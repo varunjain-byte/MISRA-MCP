@@ -10,13 +10,26 @@ logger = logging.getLogger(__name__)
 
 
 class _QuietPreprocessor(Preprocessor):
-    """A pcpp Preprocessor that silences 'Include file not found' stderr noise.
+    """A pcpp Preprocessor that silences 'Include file not found' stderr noise
+    and guards against infinite #include recursion (e.g. AUTOSAR MemMap.h).
 
     By default pcpp prints every missing-include error to stderr via
     ``on_error()``, which floods the VS Code output panel.  This subclass
     redirects those messages to Python's ``logging`` at DEBUG level and
     silently passes through unfound includes so preprocessing can continue.
+
+    AUTOSAR ``*_MemMap.h`` files are designed to be included multiple times
+    with different macro contexts.  pcpp doesn't handle this idiom and
+    recurses until it hits Python's stack limit.  We track include depth
+    and bail out early when it exceeds a safe threshold.
     """
+
+    # Maximum include nesting depth before we stop expanding
+    MAX_INCLUDE_DEPTH = 20
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._include_depth = 0
 
     def on_include_not_found(self, is_malformed, is_system_include, curdir, includepath):
         logger.debug("pcpp: include not found: %s (system=%s)", includepath, is_system_include)
@@ -25,6 +38,21 @@ class _QuietPreprocessor(Preprocessor):
     def on_error(self, file, line, msg):
         # Redirect all pcpp errors to debug logging instead of stderr
         logger.debug("pcpp: %s:%s: %s", file, line, msg)
+
+    def on_file_open(self, is_system_include, includepath):
+        """Track include depth and bail out on deep recursion."""
+        self._include_depth += 1
+        if self._include_depth > self.MAX_INCLUDE_DEPTH:
+            logger.debug("pcpp: max include depth (%d) exceeded for %s — skipping",
+                         self.MAX_INCLUDE_DEPTH, includepath)
+            self._include_depth -= 1
+            raise OutputDirective(Action.IgnoreAndPassThrough)
+        return super().on_file_open(is_system_include, includepath)
+
+    def on_file_close(self, f):
+        """Decrease depth when leaving an included file."""
+        self._include_depth = max(0, self._include_depth - 1)
+        return super().on_file_close(f)
 
 class PreprocessorEngine:
     """
@@ -90,6 +118,11 @@ class PreprocessorEngine:
             with open(full_path, "r", encoding="utf-8", errors="replace") as f:
                 pp.parse(f.read(), source=file_path)
             pp.write(output_buffer)
+        except RecursionError:
+            logger.warning("Preprocessing hit recursion limit for %s "
+                           "(likely MemMap.h re-inclusion pattern) — using raw source",
+                           file_path)
+            return b"", []
         except Exception as e:
             logger.error("Preprocessing failed for %s: %s", file_path, e)
             return b"", []
