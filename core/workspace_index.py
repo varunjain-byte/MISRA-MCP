@@ -803,31 +803,19 @@ class WorkspaceIndex:
         except Exception as e:
             logger.error("Failed to parse original %s: %s", rel_path, e)
 
-        # 2. Parse source for Symbols and Calls
-        #    If preprocessor is available, use expanded source for accuracy
-        #    Otherwise fall back to original source
-        
-        target_source = original_source
-        use_mapping = False
-        
-        if self.preprocessor and rel_path.endswith(".c"):
-            try:
-                expanded, _ = self.preprocessor.preprocess(rel_path, include_dirs=self.include_dirs)
-                if expanded and len(expanded.strip()) > 0:
-                    target_source = expanded
-                    use_mapping = True
-            except Exception as e:
-                logger.warning("Preprocessing failed for %s, falling back to raw: %s", rel_path, e)
+        # 2. Parse ORIGINAL source for Symbols and Calls.
+        #    Preprocessing via pcpp is intentionally NOT done here — it is
+        #    extremely slow on large workspaces (thousands of files × hundreds
+        #    of include dirs = millions of stat calls).  Instead, pcpp is
+        #    invoked lazily by CAnalyzer only when a specific file is being
+        #    analysed for a fix.  Raw tree-sitter parsing is fast enough for
+        #    building the symbol table and call graph.
 
         try:
-            tree = _parser.parse(target_source)
+            tree = _parser.parse(original_source)
             root = tree.root_node
-            
-            # Extract symbols and calls
-            # We must be careful: if using expanded source, it contains content from included files!
-            # We must only index nodes that map back to THIS file.
-            
-            self._walk_and_index_symbols_calls(root, target_source, rel_path, use_mapping)
+
+            self._walk_and_index_symbols_calls(root, original_source, rel_path, False)
 
         except Exception as e:
             logger.error("Failed to parse target source for %s: %s", rel_path, e)

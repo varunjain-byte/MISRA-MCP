@@ -22,17 +22,25 @@ class TestIntegrationPreprocessor(unittest.TestCase):
         cls.index.build()
         
     def test_dead_code_exclusion(self):
-        """Symbols in #if 0 blocks should not be indexed when preprocessor is used."""
+        """Symbols in #if 0 blocks ARE indexed (raw parse) but detected as
+        inactive via preprocessor active-region analysis at analysis time.
+
+        Indexing now uses raw tree-sitter parsing (no pcpp) for performance,
+        so dead-code symbols appear in the symbol table.  The preprocessor
+        is invoked lazily per-file to identify inactive regions.
+        """
         # mock_macros.c has a function 'dead_code' inside #if 0
-        
-        # Check if 'dead_code' is in symbols
-        # The symbol entry is (name, file, line...)
-        
-        # We need to find if any symbol named 'dead_code' exists in 'mock_macros.c'
         symbols = self.index.symbols.find("dead_code")
-        
-        # Should be empty because pcpp removes the #if 0 block
-        self.assertEqual(len(symbols), 0, "Current 'dead_code' should be removed by preprocessor")
+
+        # Symbol IS present in the raw-parsed index
+        self.assertGreater(len(symbols), 0,
+                           "'dead_code' should be indexed from raw source")
+
+        # But the preprocessor correctly identifies it as inactive
+        active_regions = self.preprocessor.get_active_regions("mock_macros.c")
+        is_active = any(start <= 22 <= end for start, end in active_regions)
+        self.assertFalse(is_active,
+                         "Line 22 (dead_code body) should be in an inactive region")
         
     def test_active_code_inclusion(self):
         """Active symbols should be indexed correctly."""

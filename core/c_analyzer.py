@@ -259,7 +259,7 @@ class CAnalyzer:
         return os.path.join(self.workspace_root, native)
 
     def _get_tree(self, file_path: str) -> Tuple[Optional[bytes], Optional[object]]:
-        """Parse file and cache the result."""
+        """Parse file and cache the result (raw source, no preprocessing)."""
         full = self._resolve(file_path)
         if full in self._cache:
             return self._cache[full]
@@ -281,6 +281,47 @@ class CAnalyzer:
         except Exception as e:
             logger.error("Failed to parse %s: %s", full, e)
             return None, None
+
+    def _get_preprocessed_tree(self, file_path: str) -> Tuple[Optional[bytes], Optional[object]]:
+        """Lazily preprocess a single file and return (expanded_source, tree).
+
+        This is the on-demand counterpart to _get_tree().  It runs pcpp
+        on *one* file (not the whole workspace) so that macro expansions
+        and included typedefs become visible to tree-sitter.  The result
+        is cached under a separate key so it doesn't interfere with the
+        raw-source cache used for byte-accurate edits.
+
+        Falls back to _get_tree() if no preprocessor is available or
+        preprocessing fails.
+        """
+        full = self._resolve(file_path)
+        cache_key = full + "::pp"
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        if self.preprocessor is None or self.index is None:
+            return self._get_tree(file_path)
+
+        # Compute the relative path pcpp expects
+        rel_path = file_path.replace(os.sep, "/")
+        if os.path.isabs(rel_path):
+            rel_path = os.path.relpath(rel_path, self.workspace_root).replace(os.sep, "/")
+
+        try:
+            include_dirs = getattr(self.index, 'include_dirs', ["."])
+            expanded, _ = self.preprocessor.preprocess(rel_path, include_dirs=include_dirs)
+            if expanded and len(expanded.strip()) > 0:
+                if isinstance(expanded, str):
+                    expanded = expanded.encode("utf-8")
+                tree = _parser.parse(expanded)
+                self._cache[cache_key] = (expanded, tree)
+                logger.info("On-demand preprocessed %s (%d bytes)", rel_path, len(expanded))
+                return expanded, tree
+        except Exception as e:
+            logger.warning("On-demand preprocessing failed for %s, using raw: %s", rel_path, e)
+
+        # Fallback to raw source
+        return self._get_tree(file_path)
 
     def _source_lines(self, file_path: str) -> List[str]:
         source, _ = self._get_tree(file_path)

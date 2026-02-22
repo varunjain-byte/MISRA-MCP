@@ -4,9 +4,27 @@ import io
 import re
 import logging
 from typing import List, Dict, Optional, Tuple, Set
-from pcpp import Preprocessor
+from pcpp import Preprocessor, OutputDirective, Action
 
 logger = logging.getLogger(__name__)
+
+
+class _QuietPreprocessor(Preprocessor):
+    """A pcpp Preprocessor that silences 'Include file not found' stderr noise.
+
+    By default pcpp prints every missing-include error to stderr via
+    ``on_error()``, which floods the VS Code output panel.  This subclass
+    redirects those messages to Python's ``logging`` at DEBUG level and
+    silently passes through unfound includes so preprocessing can continue.
+    """
+
+    def on_include_not_found(self, is_malformed, is_system_include, curdir, includepath):
+        logger.debug("pcpp: include not found: %s (system=%s)", includepath, is_system_include)
+        raise OutputDirective(Action.IgnoreAndPassThrough)
+
+    def on_error(self, file, line, msg):
+        # Redirect all pcpp errors to debug logging instead of stderr
+        logger.debug("pcpp: %s:%s: %s", file, line, msg)
 
 class PreprocessorEngine:
     """
@@ -52,8 +70,8 @@ class PreprocessorEngine:
             logger.error("Preprocessor: file not found %s", full_path)
             return b"", []
 
-        # Setup pcpp
-        pp = Preprocessor()
+        # Setup pcpp (using quiet subclass to suppress stderr noise)
+        pp = _QuietPreprocessor()
         
         # Add includes
         if include_dirs:
