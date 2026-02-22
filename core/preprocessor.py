@@ -2,6 +2,7 @@
 import os
 import io
 import re
+import sys
 import logging
 from typing import List, Dict, Optional, Tuple, Set
 from pcpp import Preprocessor, OutputDirective, Action
@@ -114,18 +115,27 @@ class PreprocessorEngine:
         # Capture output
         output_buffer = io.StringIO()
         
+        # Guard against infinite #include recursion (AUTOSAR *_MemMap.h
+        # files are designed for re-inclusion and cause pcpp to recurse
+        # until Python's stack overflows).  We temporarily lower the
+        # recursion limit so the RecursionError fires quickly instead of
+        # consuming the entire stack.
+        saved_limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(200)
         try:
             with open(full_path, "r", encoding="utf-8", errors="replace") as f:
                 pp.parse(f.read(), source=file_path)
             pp.write(output_buffer)
         except RecursionError:
-            logger.warning("Preprocessing hit recursion limit for %s "
-                           "(likely MemMap.h re-inclusion pattern) — using raw source",
-                           file_path)
+            logger.debug("Preprocessing hit recursion limit for %s "
+                         "(likely MemMap.h re-inclusion pattern) — using raw source",
+                         file_path)
             return b"", []
         except Exception as e:
             logger.error("Preprocessing failed for %s: %s", file_path, e)
             return b"", []
+        finally:
+            sys.setrecursionlimit(saved_limit)
 
         expanded_text = output_buffer.getvalue()
         

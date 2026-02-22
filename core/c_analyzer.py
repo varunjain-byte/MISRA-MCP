@@ -996,12 +996,22 @@ class CAnalyzer:
             if self.index and self.index.is_built:
                 analysis["cross_file"] = self.index.check_rule_8_3(fn.name)
 
-        elif rule_id == "MisraC2012-8.4" and fn:
+        elif rule_id == "MisraC2012-8.4":
             # ── Cross-file: check for prior declaration in headers ──
-            if self.index and self.index.is_built:
-                analysis["cross_file"] = self.index.check_rule_8_4(
-                    fn.name, file_path
-                )
+            # Rule 8.4 violations can appear on function definitions or
+            # variable definitions at file scope.  When get_function_at_line
+            # returns None (violation is not inside a function body), we
+            # fall back to _extract_symbol_name + workspace index lookup
+            # to find the signature.
+            sym_name = fn.name if fn else self._extract_symbol_name(file_path, line)
+            if sym_name:
+                if not fn:
+                    # Try to build a function dict from workspace index
+                    self._enrich_8_4_from_index(analysis, sym_name, file_path, line)
+                if self.index and self.index.is_built:
+                    analysis["cross_file"] = self.index.check_rule_8_4(
+                        sym_name, file_path
+                    )
 
         elif rule_id == "MisraC2012-8.5":
             sym = self._extract_symbol_name(file_path, line)
@@ -1217,6 +1227,50 @@ class CAnalyzer:
                 ]
 
         return analysis
+
+    def _enrich_8_4_from_index(self, analysis: Dict, sym_name: str,
+                               file_path: str, line: int) -> None:
+        """Populate analysis['function'] for Rule 8.4 when get_function_at_line
+        returned None (violation is on a file-scope declaration/definition).
+
+        Uses the workspace index symbol table to find the function's
+        signature, or falls back to extracting the declaration line from
+        raw source.
+        """
+        if self.index and self.index.is_built:
+            # Look for a function_def entry in the symbol table
+            entries = self.index.symbols.find(sym_name)
+            for e in entries:
+                if e.kind == "function_def":
+                    analysis["function"] = {
+                        "name": e.name,
+                        "signature": e.signature,
+                        "return_type": "",
+                        "start_line": e.line,
+                        "end_line": e.line,
+                        "is_static": e.linkage == "internal",
+                        "is_inline": False,
+                        "body_lines": 1,
+                    }
+                    return
+
+        # Fallback: extract declaration text from source line
+        source_lines = self._source_lines(file_path)
+        if 0 < line <= len(source_lines):
+            decl_line = source_lines[line - 1].strip()
+            # Remove the opening brace if present (definition line)
+            sig = decl_line.split("{")[0].strip()
+            if sig and sym_name in sig:
+                analysis["function"] = {
+                    "name": sym_name,
+                    "signature": sig,
+                    "return_type": "",
+                    "start_line": line,
+                    "end_line": line,
+                    "is_static": "static" in sig,
+                    "is_inline": "inline" in sig,
+                    "body_lines": 1,
+                }
 
     def _extract_symbol_name(self, file_path: str, line: int) -> Optional[str]:
         """Extract the primary symbol name declared/defined at a given line.

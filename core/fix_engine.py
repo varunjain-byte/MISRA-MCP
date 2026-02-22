@@ -775,9 +775,17 @@ class FixEngine:
                             ) -> "tuple[List[Dict], str]":
         """Rule 8.4: Insert a same-file forward declaration above the function.
 
-        Inserts `<signature>;` on a new line immediately before the function
+        Inserts ``<signature>;`` on a new line immediately before the function
         definition.  This satisfies Rule 8.4 (a compatible declaration is
         visible at the point of definition) without touching any other file.
+
+        The function context can come from:
+          1. ``get_function_at_line()`` — when the violation is inside a
+             function body (normal case).
+          2. ``_enrich_8_4_from_index()`` — when the violation is on a
+             file-scope definition that ``get_function_at_line`` can't find
+             (common for AUTOSAR stubs / callback definitions).
+          3. Workspace index symbol table lookup — as a last resort.
 
         Safety:
           - Skips static functions (they don't need external declarations).
@@ -786,7 +794,25 @@ class FixEngine:
             signature, so names and types match exactly (no 8.3 risk).
           - Duplicate compatible declarations are legal in C (no build error).
         """
-        fn_info = findings.get("function", {})
+        fn_info = findings.get("function") or {}
+
+        # If we still have no function info, try one last lookup via the
+        # workspace index using the violation line content.
+        if not fn_info and self.analyzer and self.analyzer.index:
+            sym = self.analyzer._extract_symbol_name(
+                violation.file_path, violation.line_number
+            )
+            if sym:
+                for entry in self.analyzer.index.symbols.find(sym):
+                    if entry.kind == "function_def" and entry.signature:
+                        fn_info = {
+                            "name": entry.name,
+                            "signature": entry.signature,
+                            "start_line": entry.line,
+                            "is_static": entry.linkage == "internal",
+                        }
+                        break
+
         if not fn_info:
             return ([], "No function context available at the violation "
                         "line. Cannot generate forward declaration.")
@@ -806,10 +832,11 @@ class FixEngine:
         if not signature:
             return ([], "Could not extract function signature from AST.")
 
-        # Clean the signature: strip storage-class specifiers that should
-        # not appear on a bare forward declaration (e.g. 'extern' is fine
-        # but is already implicit; 'inline' should be kept).
-        proto = signature.rstrip() + ";\n"
+        # Clean the signature: remove body artifacts, normalise whitespace
+        sig = signature.split("{")[0].strip()
+        # Ensure it doesn't already end with ';'
+        sig = sig.rstrip(";").rstrip()
+        proto = sig + ";\n"
 
         source = self._get_source_bytes(violation.file_path)
         if source is None:
